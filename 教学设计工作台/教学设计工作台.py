@@ -5,6 +5,7 @@ import base64
 import hashlib
 import html
 import json
+import os
 import re
 import shutil
 import sys
@@ -15,13 +16,24 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QFileSystemWatcher, QModelIndex, QIODevice, QRect, QSaveFile, QSettings, QSize, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QImage, QPainter, QPen, QPixmap, QTextCursor
+# WebEngine 在 macOS 上会探测尚未启用的 Graphite GPU 后端，并把“回退到
+# Ganesh”的内部诊断直接写入启动终端。笔记本没有 WebGL 等 GPU 需求，显式
+# 使用软件合成既能避免该诊断，也不会影响 PDF、公式和截图功能。
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-gpu-compositing --log-level=3")
+
+try:
+    from pypdf import PdfReader
+except ImportError:  # 旧安装可继续用真正的 PDF 书签；正文定位会提示补装依赖。
+    PdfReader = None
+
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QModelIndex, QIODevice, QPointF, QRect, QSaveFile, QSettings, QSize, QTimer, Qt, QUrl, Signal, qInstallMessageHandler
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QImage, QPainter, QPen, QPixmap, QTextCursor
 from PySide6.QtPdf import QPdfBookmarkModel, QPdfDocument
+from PySide6.QtPdfWidgets import QPdfView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
-    QApplication, QAbstractItemView, QComboBox, QDialog, QFileDialog, QFrame,
+    QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
     QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSplitter, QStatusBar,
     QSpinBox, QStackedWidget, QTextEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
@@ -30,6 +42,7 @@ from PySide6.QtWidgets import (
 
 APP_TITLE = "高中数学教材笔记本"
 ROOT = Path(__file__).resolve().parent
+APP_ICON_PATH = ROOT / "assets" / "textbook-notebook-icon.png"
 # 依赖安装在工作区根目录，应用脚本位于“教学设计工作台”子目录。
 KATEX_DIST = ROOT.parent / "node_modules" / "katex" / "dist"
 LEGACY_DATA_PATH = ROOT / "我的教学卡数据.json"
@@ -42,11 +55,20 @@ DATA_SOURCES = {"人教A版": "pep_sections_verified.json", "苏教版": "sj_sec
 PDF_ROOTS = {
     "人教A版": Path("/Users/chuan/高中数学/中学教材/高中/数学/人教A版"),
     "苏教版": Path("/Users/chuan/高中数学/中学教材/高中/数学/苏教版"),
+    "北师大版": Path("/Users/chuan/高中数学/中学教材/高中/数学/北师大版"),
+    "鄂教版": Path("/Users/chuan/高中数学/中学教材/高中/数学/鄂教版"),
+    "沪教版": Path("/Users/chuan/高中数学/中学教材/高中/数学/沪教版"),
+    "人教B版": Path("/Users/chuan/高中数学/中学教材/高中/数学/人教B版"),
+    "湘教版": Path("/Users/chuan/高中数学/中学教材/高中/数学/湘教版"),
 }
+REFERENCE_EDITIONS = ("北师大版", "鄂教版", "沪教版", "人教B版", "湘教版")
+COMPARISON_EDITIONS = ("人教A版", "人教B版", "苏教版", "湘教版", "北师大版", "沪教版", "鄂教版")
+COMPARISON_DEFAULT_EDITIONS = {"人教A版", "人教B版", "苏教版", "湘教版", "北师大版"}
 LOCAL_SCREENSHOT_DIR = ROOT / "教材截图"
 # 为兼容既有的截图调用保留这个名称；启用同步后会指向同步资料夹。
 SCREENSHOT_DIR = LOCAL_SCREENSHOT_DIR
 SCREENSHOT_TOKEN = re.compile(r"\[\[教材截图:([0-9a-f]{32})\]\]")
+REFERENCE_BOOKMARKS_PATH = ROOT / "参考教材书签.json"
 
 SECTION_META = {
     "knowledge": ("知识点列表", ""),
@@ -54,11 +76,68 @@ SECTION_META = {
     "examples": ("有价值的例习题", ""),
     "questions": ("问题串设计", ""),
     "pitfalls": ("易错与辨析", ""),
+    "other_references": ("其他版本参考", ""),
 }
+
+
+def _qt_message_handler(_mode, _context, message: str) -> None:
+    """只静默 QtPdf 已知的书签兼容告警，其他诊断仍保留在终端。"""
+    if "qt.pdf.bookmarks: bookmark with invalid location and/or zoom" in message:
+        return
+    sys.stderr.write(f"{message}\n")
 
 
 def bookmark_key(text: str) -> str:
     return re.sub(r"[\s·．.、,，:：;；（）()【】\[\]－—-]", "", str(text)).lower()
+
+
+# 跨版本教材的编号与册次都不可靠；只保留能表示数学内容的词组。
+# 词表用于消除“概念、应用、基本”等高频虚词造成的误匹配，而不是把
+# 不同教材的章节编号当成对应关系。
+REFERENCE_CONCEPTS = tuple(sorted({
+    "全称量词", "存在量词", "充分条件", "必要条件", "基本不等式", "一元二次不等式", "一元二次方程",
+    "集合", "子集", "补集", "交集", "并集", "命题", "等式", "不等式", "二分法",
+    "函数单调性", "函数奇偶性", "函数概念", "函数表示", "函数应用", "幂函数", "指数函数", "对数函数",
+    "任意角", "弧度制", "三角函数", "诱导公式", "三角恒等变换", "正弦定理", "余弦定理", "解三角形",
+    "平面向量", "空间向量", "向量数量积", "向量基本定理", "向量坐标", "复数", "直线", "圆", "椭圆", "双曲线", "抛物线", "圆锥曲线",
+    "立体几何", "空间几何体", "平面", "平行", "垂直", "数列", "等差数列", "等比数列", "数学归纳法",
+    "导数", "排列", "组合", "二项式定理", "条件概率", "全概率公式", "随机变量", "二项分布", "超几何分布", "正态分布",
+    "相关性", "线性回归", "独立性检验", "随机抽样", "统计图表", "样本估计", "随机事件", "频率与概率",
+}, key=len, reverse=True))
+
+
+def reference_title_key(text: str) -> str:
+    """规范化跨版本目录标题；明确删除编号，绝不以编号作为对应依据。"""
+    value = str(text or "").translate(_FULLWIDTH_DIGITS)
+    value = re.sub(r"(?:第\s*)?\d+\s*(?:章|节|[．.]\s*\d+){0,3}", "", value)
+    value = value.replace("图象", "图像").replace("及其", "").replace("的", "")
+    value = value.replace("一元线性回归分析", "一元线性回归").replace("线性回归模型", "一元线性回归")
+    value = value.replace("基本性质", "性质").replace("概念及意义", "概念")
+    return bookmark_key(value)
+
+
+def reference_concepts(text: str) -> set[str]:
+    key = reference_title_key(text)
+    return {concept for concept in REFERENCE_CONCEPTS if reference_title_key(concept) in key}
+
+
+def reference_similarity(source: str, target: str) -> int:
+    """只按概念标题相似度评分；返回 0 表示不应给出自动候选。"""
+    source_key, target_key = reference_title_key(source), reference_title_key(target)
+    if not source_key or not target_key:
+        return 0
+    if source_key == target_key:
+        return 320
+    if len(source_key) >= 4 and (source_key in target_key or target_key in source_key):
+        return 220 + min(40, len(min(source_key, target_key, key=len)) * 2)
+    source_terms, target_terms = reference_concepts(source), reference_concepts(target)
+    shared = source_terms & target_terms
+    if shared:
+        # 两个以上专业词一致才允许成为高置信候选；单个泛词只留给手动修正窗口。
+        return len(shared) * 90 + sum(min(24, len(term) * 3) for term in shared)
+    # 保留少量字面重叠作为“修正定位”里的检索候选，但绝不自动打开。
+    overlap = len(set(source_key) & set(target_key))
+    return overlap * 5 if overlap >= 3 else 0
 
 
 _FULLWIDTH_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
@@ -87,7 +166,10 @@ def catalog_chapter_titles(book: dict) -> dict[str, str]:
 class PdfReferenceIndex:
     """从 PDF 书签生成“小节 → 起止页”的可重复映射。页码对用户始终按 1 开始显示。"""
     def __init__(self):
-        self._outlines: dict[Path, tuple[int, list[dict]]] = {}
+        self._outlines: dict[Path, tuple[int, int, list[dict]]] = {}
+
+    def invalidate(self) -> None:
+        self._outlines.clear()
 
     def pdf_path_for(self, lesson: dict) -> Path:
         return PDF_ROOTS.get(lesson.get("edition"), Path()) / lesson.get("file", "")
@@ -125,16 +207,21 @@ class PdfReferenceIndex:
         return {"path": pdf_path, "start": start, "end": end, "source": "bookmark", "bookmark": match["title"]}
 
     def _outline_for(self, pdf_path: Path) -> tuple[int, list[dict]]:
-        if pdf_path in self._outlines:
-            return self._outlines[pdf_path]
+        try:
+            modified = pdf_path.stat().st_mtime_ns
+        except OSError:
+            modified = -1
+        cached = self._outlines.get(pdf_path)
+        if cached and cached[0] == modified:
+            return cached[1], cached[2]
         if not pdf_path.exists():
             result = (0, [])
-            self._outlines[pdf_path] = result
+            self._outlines[pdf_path] = (modified, *result)
             return result
         document = QPdfDocument()
         if document.load(str(pdf_path)) != QPdfDocument.Error.None_:
             result = (0, [])
-            self._outlines[pdf_path] = result
+            self._outlines[pdf_path] = (modified, *result)
             return result
         model = QPdfBookmarkModel()
         model.setDocument(document)
@@ -151,9 +238,607 @@ class PdfReferenceIndex:
                 visit(index)
 
         visit()
+        # 只有目录叶节点才适合跨版本逐节匹配。章名和“大节”只做组织，
+        # 不参与候选排序，避免“函数”“概率”之类大标题抢走具体小节。
+        for index, item in enumerate(outline):
+            item["is_leaf"] = not (
+                index + 1 < len(outline) and outline[index + 1]["level"] > item["level"]
+            )
         result = (document.pageCount(), outline)
-        self._outlines[pdf_path] = result
+        self._outlines[pdf_path] = (modified, *result)
         return result
+
+
+class ReferenceTextbookIndex:
+    """仅为右侧阅读器建立参考教材书签索引，不参与左侧主教材目录。"""
+    def __init__(self, pdf_index: PdfReferenceIndex):
+        self.pdf_index = pdf_index
+        self._targets: dict[str, list[dict]] = {}
+        self._generated: dict[str, list[dict]] = {}
+        try:
+            payload = json.loads(REFERENCE_BOOKMARKS_PATH.read_text(encoding="utf-8"))
+            generated = payload.get("generated", {})
+            self._generated = generated if isinstance(generated, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def _remember_generated(self, target: dict) -> None:
+        edition = str(target.get("edition") or "")
+        if not edition:
+            return
+        entries = self._generated.setdefault(edition, [])
+        signature = (target.get("book"), target.get("page"), target.get("title"))
+        if any((item.get("book"), item.get("page"), item.get("title")) == signature for item in entries if isinstance(item, dict)):
+            return
+        entries.append(target)
+        try:
+            REFERENCE_BOOKMARKS_PATH.write_text(json.dumps({"version": 1, "generated": self._generated}, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    @staticmethod
+    def _useful_bookmark(item: dict, book: str) -> bool:
+        """排除扫描件生成的“每页一个书签”，它们不是可定位的教材目录。"""
+        title = str(item.get("title") or "").strip()
+        compact = bookmark_key(title)
+        if not compact or re.search(r"(?:页面|page|p)0*\d+$", compact, re.I):
+            return False
+        # 例如“第1章 集合_p0002”是逐页标签，章名本身并不是当前页的小节名。
+        if re.search(r"[_－-](?:p|页)0*\d+", title, re.I):
+            return False
+        return compact != bookmark_key(clean_name(book))
+
+    @staticmethod
+    def _title_fragments(lesson: dict) -> list[str]:
+        """用于正文索引的最小关键词，避免整句标题在不同版本中无法逐字匹配。"""
+        title = re.sub(r"[（(].*?[）)]", "", str(lesson.get("section_title") or ""))
+        fragments = [part.strip() for part in re.split(r"[、，,与和及的之]\s*", title) if len(part.strip()) >= 2]
+        if title.strip():
+            fragments.insert(0, title.strip())
+        return list(dict.fromkeys(fragments))[:5]
+
+    def _text_targets(self, edition: str, pdf_path: Path, lesson: dict) -> list[dict]:
+        """无有效章节书签时，从可提取文本中找正文首页；跳过封面与目录等前置页。"""
+        if PdfReader is None:
+            return []
+        try:
+            reader = PdfReader(str(pdf_path))
+        except Exception:
+            return []
+        fragments = self._title_fragments(lesson)
+        if not fragments:
+            return []
+        hits: list[tuple[int, int]] = []
+        for index, page in enumerate(reader.pages):
+            # 大多数教材的封面、版权与目录在前八页；不允许它们成为自动定位结果。
+            if index < 8:
+                continue
+            try:
+                text = (page.extract_text() or "").replace(" ", "").replace("\n", "")
+            except Exception:
+                continue
+            text_score = sum(16 + min(18, len(fragment) * 2) for fragment in fragments if fragment in text)
+            score = text_score
+            # 跨版本的节次编号、册次都不能证明内容对应；只保留标题命中。
+            if text_score:
+                hits.append((score, index + 1))
+        if not hits:
+            return []
+        # 同一标题会贯穿后续页面，只取第一个高可信正文页。
+        best_score = max(score for score, _page in hits)
+        page = min(page for score, page in hits if score >= best_score * 0.72)
+        return [{"edition": edition, "book": pdf_path.name, "title": lesson.get("section_title", ""),
+                 "page": page, "level": 0, "source": "text"}]
+
+    @staticmethod
+    def _same_volume(pdf_path: Path, lesson: dict) -> bool:
+        """先锁定同一册，避免把“集合”之类高频词匹配到另一册。"""
+        source = str(lesson.get("file") or "")
+        target = pdf_path.name
+        selected = re.search(r"选择性必修\s*(\d+)", source)
+        if selected:
+            return bool(re.search(rf"选择性必修\s*{selected.group(1)}", target))
+        required = re.search(r"(?<!选择性)必修\s*(\d+)", source)
+        if required:
+            return bool(re.search(rf"(?<!选择性)必修\s*{required.group(1)}", target))
+        return True
+
+    def invalidate(self) -> None:
+        self.pdf_index.invalidate()
+        self._targets.clear()
+
+    def books(self, edition: str) -> list[str]:
+        root = PDF_ROOTS.get(edition, Path())
+        if not root.exists():
+            return []
+        return [path.name for path in sorted(root.glob("*.pdf")) if "2007" not in path.name and "教学参考" not in path.name]
+
+    def targets(self, edition: str) -> list[dict]:
+        if edition not in REFERENCE_EDITIONS:
+            return []
+        if edition in self._targets:
+            return self._targets[edition]
+        root = PDF_ROOTS.get(edition, Path())
+        # 早期版本把正文检索结果写入本机缓存，可能残留旧的编号式误定位。
+        # 现在只以 PDF 的真实目录为准；没有目录时仅临时搜索正文，不持久化。
+        targets: list[dict] = []
+        if root.exists():
+            for pdf_path in sorted(root.glob("*.pdf")):
+                # 参考层明确排除旧版及教学参考用书。
+                if "2007" in pdf_path.name or "教学参考" in pdf_path.name:
+                    continue
+                _count, outline = self.pdf_index._outline_for(pdf_path)
+                if outline:
+                    for item in outline:
+                        title = str(item.get("title") or "").strip()
+                        if item.get("is_leaf") and self._useful_bookmark(item, pdf_path.name):
+                            targets.append({"edition": edition, "book": pdf_path.name, "title": title,
+                                            "page": int(item.get("page", 0)) + 1, "level": int(item.get("level", 0))})
+        self._targets[edition] = targets
+        return targets
+
+    def candidates(self, lesson: dict, edition: str, limit: int = 12) -> list[dict]:
+        scored = []
+        for target in self.targets(edition):
+            score = reference_similarity(str(lesson.get("section_title") or ""), str(target.get("title") or ""))
+            scored.append((score, target))
+        bookmark_matches = [dict(target, score=score) for score, target in sorted(scored, key=lambda item: item[0], reverse=True) if score > 0]
+        if bookmark_matches:
+            return bookmark_matches[:limit]
+        # 书签无效/缺失时，改用正文索引；绝不伪造“第 1 页”的匹配。
+        text_matches: list[dict] = []
+        root = PDF_ROOTS.get(edition, Path())
+        if root.exists():
+            for pdf_path in sorted(root.glob("*.pdf")):
+                if "2007" in pdf_path.name or "教学参考" in pdf_path.name:
+                    continue
+                text_matches.extend(self._text_targets(edition, pdf_path, lesson))
+        return text_matches[:limit]
+
+
+class ReferenceLocationDialog(QDialog):
+    """选择一个或多个参考教材书签；不会更改左侧主教材目录。"""
+    def __init__(self, lesson: dict, index: ReferenceTextbookIndex, existing: dict[str, list[dict]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("修正参考教材定位")
+        self.resize(700, 520)
+        self.lesson = lesson
+        self.index = index
+        self.mapping = {edition: [dict(item) for item in entries] for edition, entries in existing.items() if isinstance(entries, list)}
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"当前小节：{lesson['section_no']}  {lesson['section_title']}"))
+        top = QHBoxLayout()
+        self.edition = QComboBox()
+        self.edition.addItems(REFERENCE_EDITIONS)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("筛选书签或教材名称")
+        top.addWidget(self.edition)
+        top.addWidget(self.search, 1)
+        layout.addLayout(top)
+        self.items = QListWidget()
+        self.items.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        layout.addWidget(self.items, 1)
+        manual = QHBoxLayout()
+        self.manual_book = QComboBox()
+        self.manual_page = QSpinBox()
+        self.manual_page.setRange(1, 2000)
+        self.manual_title = QLineEdit()
+        self.manual_title.setPlaceholderText("手动标签名称（可留空）")
+        self.manual_add = QPushButton("添加手动标签")
+        self.manual_add.setObjectName("smallAction")
+        self.manual_add.clicked.connect(self.add_manual)
+        manual.addWidget(self.manual_book, 2)
+        manual.addWidget(self.manual_page)
+        manual.addWidget(self.manual_title, 3)
+        manual.addWidget(self.manual_add)
+        layout.addLayout(manual)
+        actions = QHBoxLayout()
+        self.add = QPushButton("加入本节参考")
+        self.add.setObjectName("primaryCompact")
+        self.add.clicked.connect(self.add_selected)
+        self.clear = QPushButton("清除此版本定位")
+        self.clear.setObjectName("smallAction")
+        self.clear.clicked.connect(self.clear_current)
+        actions.addWidget(self.add)
+        actions.addWidget(self.clear)
+        actions.addStretch()
+        cancel = QPushButton("取消")
+        cancel.setObjectName("smallAction")
+        cancel.clicked.connect(self.reject)
+        done = QPushButton("完成")
+        done.setObjectName("primaryCompact")
+        done.clicked.connect(self.accept)
+        actions.addWidget(cancel)
+        actions.addWidget(done)
+        layout.addLayout(actions)
+        self.edition.currentTextChanged.connect(self.populate)
+        self.search.textChanged.connect(self.populate)
+        self.populate()
+
+    def populate(self) -> None:
+        edition = self.edition.currentText()
+        query = bookmark_key(self.search.text())
+        existing = {(entry.get("book"), entry.get("page"), entry.get("title")) for entry in self.mapping.get(edition, [])}
+        self.items.clear()
+        self.manual_book.blockSignals(True)
+        previous = self.manual_book.currentText()
+        self.manual_book.clear()
+        self.manual_book.addItems(self.index.books(edition))
+        if previous:
+            index = self.manual_book.findText(previous)
+            if index >= 0:
+                self.manual_book.setCurrentIndex(index)
+        self.manual_book.blockSignals(False)
+        candidates = self.index.candidates(self.lesson, edition, 300)
+        for target in candidates:
+            label = f"{clean_name(target['book'])}  ·  第 {target['page']} 页\n{target['title']}"
+            if query and query not in bookmark_key(label):
+                continue
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, target)
+            if (target["book"], target["page"], target["title"]) in existing:
+                item.setSelected(True)
+            self.items.addItem(item)
+
+    def add_selected(self) -> None:
+        edition = self.edition.currentText()
+        selected = [item.data(Qt.ItemDataRole.UserRole) for item in self.items.selectedItems()]
+        if not selected:
+            return
+        existing = self.mapping.setdefault(edition, [])
+        seen = {(item.get("book"), item.get("page"), item.get("title")) for item in existing}
+        for item in selected:
+            key = (item.get("book"), item.get("page"), item.get("title"))
+            if key not in seen:
+                entry = {key: value for key, value in item.items() if key != "score"}
+                entry["confirmed"] = True
+                existing.append(entry)
+                seen.add(key)
+        self.populate()
+
+    def clear_current(self) -> None:
+        self.mapping.pop(self.edition.currentText(), None)
+        self.populate()
+
+    def add_manual(self) -> None:
+        edition = self.edition.currentText()
+        book = self.manual_book.currentText()
+        if not book:
+            return
+        page = self.manual_page.value()
+        title = self.manual_title.text().strip() or f"手动定位 · 第 {page} 页"
+        entry = {"edition": edition, "book": book, "title": title, "page": page, "level": 0,
+                 "source": "manual", "confirmed": True}
+        existing = self.mapping.setdefault(edition, [])
+        if not any((item.get("book"), item.get("page")) == (book, page) for item in existing):
+            existing.append(entry)
+        self.populate()
+
+
+class ComparisonTargetDialog(QDialog):
+    """从某版本的真实书签中手动选择一节，用于对比阅读定位。"""
+    def __init__(self, edition: str, targets: list[dict], current_title: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"选择 {edition} 对应内容")
+        self.resize(650, 560)
+        self.targets = targets
+        self.selected: dict | None = None
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"当前小节：{current_title}"))
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜索该版本的书名、书签或页码")
+        layout.addWidget(self.search)
+        self.items = QListWidget()
+        layout.addWidget(self.items, 1)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        cancel = QPushButton("取消")
+        cancel.setObjectName("smallAction")
+        cancel.clicked.connect(self.reject)
+        choose = QPushButton("使用这一节")
+        choose.setObjectName("primaryCompact")
+        choose.clicked.connect(self.accept_selected)
+        actions.addWidget(cancel)
+        actions.addWidget(choose)
+        layout.addLayout(actions)
+        self.search.textChanged.connect(self.populate)
+        self.items.itemDoubleClicked.connect(lambda _item: self.accept_selected())
+        self.populate()
+
+    def populate(self) -> None:
+        query = bookmark_key(self.search.text())
+        self.items.clear()
+        for target in self.targets:
+            label = f"{clean_name(str(target.get('book', '')))}  ·  第 {target.get('page', 1)} 页\n{target.get('title', '')}"
+            if query and query not in bookmark_key(label):
+                continue
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, target)
+            self.items.addItem(item)
+        if self.items.count():
+            self.items.setCurrentRow(0)
+
+    def accept_selected(self) -> None:
+        current = self.items.currentItem()
+        if current is None:
+            return
+        value = current.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(value, dict):
+            return
+        self.selected = dict(value)
+        self.accept()
+
+
+class ComparisonPane(QFrame):
+    """一个版本的一本连续 PDF 阅读栏；QPdfView 只在鼠标所在栏接收滚轮。"""
+    manual_location_requested = Signal(str)
+
+    def __init__(self, edition: str, parent=None):
+        super().__init__(parent)
+        self.edition = edition
+        self.targets: list[dict] = []
+        self.setObjectName("comparisonPane")
+        self.setMinimumWidth(0)
+        self.document = QPdfDocument(self)
+        self.view = QPdfView()
+        self.view.setObjectName("comparisonPdfView")
+        self.view.setDocument(self.document)
+        self.view.setPageMode(QPdfView.PageMode.MultiPage)
+        self.view.setPageSpacing(8)
+        self.view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+        self.view.viewport().installEventFilter(self)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        header = QHBoxLayout()
+        self.heading = QLabel(edition)
+        self.heading.setObjectName("comparisonPaneTitle")
+        header.addWidget(self.heading)
+        header.addStretch()
+        self.fix = QPushButton("改定位")
+        self.fix.setObjectName("smallAction")
+        self.fix.clicked.connect(lambda: self.manual_location_requested.emit(self.edition))
+        header.addWidget(self.fix)
+        layout.addLayout(header)
+        self.target_box = QComboBox()
+        self.target_box.setObjectName("comparisonTargetBox")
+        self.target_box.setMinimumWidth(0)
+        self.target_box.activated.connect(self.open_index)
+        target_row = QHBoxLayout()
+        target_row.setSpacing(5)
+        target_row.addWidget(self.target_box, 1)
+        self.zoom_out = QPushButton("−")
+        self.zoom_out.setObjectName("comparisonZoomControl")
+        self.zoom_out.setToolTip("缩小（也可按住 Ctrl 后滚轮缩放）")
+        self.zoom_out.clicked.connect(lambda: self.zoom_box.setValue(self.zoom_box.value() - 10))
+        target_row.addWidget(self.zoom_out)
+        self.zoom_box = QSpinBox()
+        self.zoom_box.setObjectName("comparisonZoomBox")
+        self.zoom_box.setRange(45, 240)
+        self.zoom_box.setSingleStep(10)
+        self.zoom_box.setValue(100)
+        self.zoom_box.setSuffix("%")
+        self.zoom_box.setToolTip("缩放本栏教材")
+        self.zoom_box.valueChanged.connect(self.apply_custom_zoom)
+        target_row.addWidget(self.zoom_box)
+        self.zoom_in = QPushButton("+")
+        self.zoom_in.setObjectName("comparisonZoomControl")
+        self.zoom_in.setToolTip("放大（也可按住 Ctrl 后滚轮缩放）")
+        self.zoom_in.clicked.connect(lambda: self.zoom_box.setValue(self.zoom_box.value() + 10))
+        target_row.addWidget(self.zoom_in)
+        self.fit_width = QPushButton("适宽")
+        self.fit_width.setObjectName("comparisonFit")
+        self.fit_width.setToolTip("适合当前栏宽度")
+        self.fit_width.clicked.connect(self.fit_to_width)
+        target_row.addWidget(self.fit_width)
+        layout.addLayout(target_row)
+        self.stack = QStackedWidget()
+        self.empty = QLabel("正在寻找对应小节…")
+        self.empty.setObjectName("comparisonEmpty")
+        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty.setWordWrap(True)
+        self.stack.addWidget(self.view)
+        self.stack.addWidget(self.empty)
+        self.stack.setCurrentWidget(self.empty)
+        layout.addWidget(self.stack, 1)
+
+    @staticmethod
+    def confidence_label(score: int) -> str:
+        if score >= 320:
+            return "题名一致"
+        if score >= 220:
+            return "较高置信"
+        if score < 40:
+            return "低置信候选"
+        if score > 0:
+            return "候选"
+        return "手动定位"
+
+    def set_targets(self, targets: list[dict], selected: dict | None = None) -> None:
+        self.targets = [dict(item) for item in targets]
+        self.target_box.blockSignals(True)
+        self.target_box.clear()
+        for target in self.targets:
+            score = int(target.get("score", 0) or 0)
+            label = f"{self.confidence_label(score)} · {target.get('title', '')} · 第 {target.get('page', 1)} 页"
+            self.target_box.addItem(label, target)
+        self.target_box.blockSignals(False)
+        self.target_box.setVisible(bool(self.target_box.count()))
+        if selected:
+            signature = (selected.get("book"), selected.get("page"), selected.get("title"))
+            for index in range(self.target_box.count()):
+                value = self.target_box.itemData(index)
+                if isinstance(value, dict) and (value.get("book"), value.get("page"), value.get("title")) == signature:
+                    self.target_box.setCurrentIndex(index)
+                    break
+        if self.target_box.count():
+            self.open_target(self.target_box.currentData())
+        else:
+            self.target_box.setVisible(False)
+            self.empty.setText("未找到可信的默认对应节。\n点击“改定位”可从本版本目录中手动选择。")
+            self.stack.setCurrentWidget(self.empty)
+
+    def open_index(self, index: int) -> None:
+        self.open_target(self.target_box.itemData(index))
+
+    def open_target(self, target: object) -> None:
+        if not isinstance(target, dict):
+            return
+        path = Path(str(target.get("path") or ""))
+        if not path.exists():
+            self.empty.setText(f"本机未找到《{clean_name(str(target.get('book', '')))}》PDF。\n请先配置该版本教材目录。")
+            self.stack.setCurrentWidget(self.empty)
+            return
+        if self.document.load(str(path)) != QPdfDocument.Error.None_:
+            self.empty.setText("无法读取这本 PDF。")
+            self.stack.setCurrentWidget(self.empty)
+            return
+        page = max(1, min(int(target.get("page") or 1), self.document.pageCount()))
+        self.fit_to_width()
+        self.stack.setCurrentWidget(self.view)
+        self.view.pageNavigator().jump(page - 1, QPointF(0, 0), self.view.zoomFactor())
+
+    def apply_custom_zoom(self, value: int) -> None:
+        self.view.setZoomMode(QPdfView.ZoomMode.Custom)
+        self.view.setZoomFactor(max(0.45, min(2.4, value / 100.0)))
+
+    def fit_to_width(self) -> None:
+        self.view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+
+    def _adjust_zoom(self, amount: int) -> None:
+        if amount:
+            self.zoom_box.setValue(max(self.zoom_box.minimum(), min(self.zoom_box.maximum(), self.zoom_box.value() + amount)))
+
+    def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+        if watched is self.view.viewport():
+            if event.type() == QEvent.Type.Wheel and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                delta = event.angleDelta().y() or event.pixelDelta().y()
+                if delta:
+                    self._adjust_zoom(10 if delta > 0 else -10)
+                    event.accept()
+                    return True
+            if event.type() == QEvent.Type.NativeGesture and hasattr(event, "gestureType"):
+                native_type = getattr(getattr(Qt, "NativeGestureType", object), "ZoomNativeGesture", None)
+                if native_type is not None and event.gestureType() == native_type:
+                    amount = float(event.value())
+                    if amount:
+                        self._adjust_zoom(max(4, round(abs(amount) * 100)) * (1 if amount > 0 else -1))
+                        event.accept()
+                        return True
+        return super().eventFilter(watched, event)
+
+
+class ComparisonWindow(QDialog):
+    """七版本并列对比阅读窗口。"""
+    def __init__(self, owner, lesson: dict, parent=None):
+        super().__init__(parent)
+        self.owner = owner
+        self.lesson = lesson
+        self.panes: dict[str, ComparisonPane] = {}
+        self.switches: dict[str, QCheckBox] = {}
+        self.initialized_panes: set[str] = set()
+        self.setObjectName("comparisonWindow")
+        self.setWindowTitle(f"对比阅读 · {lesson['section_no']} {lesson['section_title']}")
+        # 初始尺寸仅作为极少数窗口管理器不支持最大化时的后备值；实际展示时
+        # 由 showMaximized() 交给系统按当前屏幕的可用区域铺满。
+        self.resize(1200, 780)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 12)
+        layout.setSpacing(8)
+        heading = QLabel(f"对比阅读  ·  {lesson['section_no']} {lesson['section_title']}")
+        heading.setObjectName("comparisonWindowTitle")
+        layout.addWidget(heading)
+        switch_row = QHBoxLayout()
+        switch_row.setSpacing(12)
+        for edition in COMPARISON_EDITIONS:
+            switch = QCheckBox(edition.replace("版", ""))
+            switch.setObjectName("comparisonSwitch")
+            switch.setChecked(edition in COMPARISON_DEFAULT_EDITIONS)
+            switch.toggled.connect(lambda visible, key=edition: self.set_pane_visible(key, visible))
+            self.switches[edition] = switch
+            switch_row.addWidget(switch)
+        switch_row.addStretch()
+        layout.addLayout(switch_row)
+        # 不使用横向滚动容器：所有开启版本永远平分当前窗口宽度。
+        self.pane_row = QWidget()
+        self.pane_row.setObjectName("comparisonPaneRow")
+        self.pane_layout = QHBoxLayout(self.pane_row)
+        self.pane_layout.setContentsMargins(0, 0, 0, 0)
+        self.pane_layout.setSpacing(8)
+        for edition in COMPARISON_EDITIONS:
+            pane = ComparisonPane(edition)
+            pane.manual_location_requested.connect(self.choose_location)
+            self.panes[edition] = pane
+            self.pane_layout.addWidget(pane, 1)
+        layout.addWidget(self.pane_row, 1)
+        for edition in COMPARISON_EDITIONS:
+            self.set_pane_visible(edition, self.switches[edition].isChecked())
+        self.refresh_pane_layout()
+
+    def refresh_pane_layout(self) -> None:
+        # QHBoxLayout 会自动把剩余宽度等分给所有可见栏；不保留最小总宽度，
+        # 从而保证不产生横向滚动条。
+        for edition, pane in self.panes.items():
+            self.pane_layout.setStretchFactor(pane, 1 if self.switches[edition].isChecked() else 0)
+        self.pane_row.updateGeometry()
+
+    def set_pane_visible(self, edition: str, visible: bool) -> None:
+        pane = self.panes[edition]
+        if visible and edition not in self.initialized_panes:
+            candidates, selected = self.owner.comparison_targets_for(self.lesson, edition)
+            pane.set_targets(candidates, selected)
+            self.initialized_panes.add(edition)
+        pane.setVisible(visible)
+        self.refresh_pane_layout()
+
+    def choose_location(self, edition: str) -> None:
+        all_targets = self.owner.comparison_all_targets(edition)
+        dialog = ComparisonTargetDialog(edition, all_targets, self.lesson["section_title"], self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.selected:
+            return
+        target = dict(dialog.selected, confirmed=True, score=999)
+        self.owner.save_comparison_mapping(self.lesson["id"], edition, target)
+        self.panes[edition].set_targets([target], target)
+        self.initialized_panes.add(edition)
+
+
+class SharedReferencePeerDialog(QDialog):
+    """让用户确认或改选人教 A / 苏教的小节对应关系，绝不静默共享。"""
+    def __init__(self, lesson: dict, candidates: list[dict], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("确认共享小节")
+        self.resize(620, 410)
+        self.selected: dict | None = None
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"当前：{lesson['edition']} · {lesson['section_no']} {lesson['section_title']}"))
+        layout.addWidget(QLabel("选择另一主教材中要共享“其他版本参考”的小节："))
+        self.items = QListWidget()
+        for candidate in candidates:
+            item = QListWidgetItem(f"{candidate['edition']} · {candidate['section_no']}  {candidate['section_title']}\n{candidate['chapter']} · {clean_name(candidate['file'])}")
+            item.setData(Qt.ItemDataRole.UserRole, candidate)
+            self.items.addItem(item)
+        if self.items.count():
+            self.items.setCurrentRow(0)
+        layout.addWidget(self.items, 1)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        cancel = QPushButton("取消")
+        cancel.setObjectName("smallAction")
+        cancel.clicked.connect(self.reject)
+        done = QPushButton("确认共享")
+        done.setObjectName("primaryCompact")
+        done.clicked.connect(self.choose)
+        actions.addWidget(cancel)
+        actions.addWidget(done)
+        layout.addLayout(actions)
+
+    def choose(self) -> None:
+        item = self.items.currentItem()
+        if item is None:
+            return
+        self.selected = item.data(Qt.ItemDataRole.UserRole)
+        self.accept()
 
 class PdfCropLabel(QLabel):
     """显示已渲染 PDF 页并让用户拖拽框选截图区域。"""
@@ -415,6 +1100,10 @@ class PdfReaderPanel(QFrame):
     capture_confirmed = Signal(object, int, object)
     capture_cancelled = Signal()
     locate_requested = Signal()
+    reference_edition_requested = Signal(str)
+    reference_target_requested = Signal(object)
+    reference_correction_requested = Signal()
+    return_to_primary_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -425,6 +1114,20 @@ class PdfReaderPanel(QFrame):
         self.highlight_rect: dict | None = None
         self.capture_mode = False
         self.fit_width_enabled = False
+        self.reference_mode = False
+        self.continuous_mode = True
+        self._continuous_labels: dict[int, QLabel] = {}
+        self._continuous_updating = False
+        self._pending_continuous_direction = 0
+        # 连续缩放时不要为每一个滚轮刻度同步重绘 PDF；等手势停顿后只画一次。
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(90)
+        self._render_timer.timeout.connect(self.refresh_reader_view)
+        # 将“接下一页”移出滚动信号调用栈，避免滚动条变化触发递归渲染。
+        self._continuous_extend_timer = QTimer(self)
+        self._continuous_extend_timer.setSingleShot(True)
+        self._continuous_extend_timer.timeout.connect(self.extend_continuous_pages)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -454,6 +1157,22 @@ class PdfReaderPanel(QFrame):
         self.locate_button.setObjectName("smallAction")
         self.locate_button.clicked.connect(self.locate_requested.emit)
         navigation.addWidget(self.locate_button)
+        self.reference_box = QComboBox()
+        self.reference_box.setObjectName("readerReferenceBox")
+        self.reference_box.addItem("参考版本", "")
+        for edition in REFERENCE_EDITIONS:
+            self.reference_box.addItem(edition, edition)
+        self.reference_box.currentIndexChanged.connect(self.request_reference_edition)
+        navigation.addWidget(self.reference_box)
+        self.reference_fix = QPushButton("修正定位")
+        self.reference_fix.setObjectName("smallAction")
+        self.reference_fix.clicked.connect(self.reference_correction_requested.emit)
+        navigation.addWidget(self.reference_fix)
+        self.return_primary = QPushButton("返回当前教材")
+        self.return_primary.setObjectName("smallAction")
+        self.return_primary.clicked.connect(self.return_to_primary_requested.emit)
+        self.return_primary.setVisible(False)
+        navigation.addWidget(self.return_primary)
         layout.addLayout(navigation)
 
         zoom_controls = QHBoxLayout()
@@ -480,6 +1199,13 @@ class PdfReaderPanel(QFrame):
         self.fit_width.setObjectName("smallAction")
         self.fit_width.clicked.connect(self.fit_to_width)
         zoom_controls.addWidget(self.fit_width)
+        self.continuous_toggle = QPushButton("连续")
+        self.continuous_toggle.setObjectName("smallAction")
+        self.continuous_toggle.setCheckable(True)
+        self.continuous_toggle.setChecked(True)
+        self.continuous_toggle.setToolTip("连续滚动阅读；框选截图时自动切为当前页")
+        self.continuous_toggle.toggled.connect(self.set_continuous_mode)
+        zoom_controls.addWidget(self.continuous_toggle)
         zoom_controls.addStretch()
         layout.addLayout(zoom_controls)
 
@@ -488,6 +1214,11 @@ class PdfReaderPanel(QFrame):
         self.bookmarks.addItem("书签与章节跳转", None)
         self.bookmarks.currentIndexChanged.connect(self.jump_to_bookmark)
         layout.addWidget(self.bookmarks)
+        self.reference_targets = QComboBox()
+        self.reference_targets.setObjectName("bookmarkBox")
+        self.reference_targets.currentIndexChanged.connect(self.request_reference_target)
+        self.reference_targets.setVisible(False)
+        layout.addWidget(self.reference_targets)
 
         self.capture_bar = QFrame()
         self.capture_bar.setObjectName("captureBar")
@@ -506,7 +1237,22 @@ class PdfReaderPanel(QFrame):
         self.capture_bar.setVisible(False)
         layout.addWidget(self.capture_bar)
 
+        # 常规阅读交给 Qt 原生 PDF 视图：它本身支持稳定的多页连续滚动，
+        # 不能再把多张 QImage 手工堆进滚动容器。
+        self.native_view = QPdfView()
+        self.native_view.setObjectName("nativePdfView")
+        self.native_view.setDocument(self.document)
+        self.native_view.setPageMode(QPdfView.PageMode.MultiPage)
+        self.native_view.setPageSpacing(10)
+        self.native_view.viewport().installEventFilter(self)
+        self.native_view.pageNavigator().currentPageChanged.connect(self.on_native_page_changed)
+
         self.crop_label = PdfCropLabel()
+        self.page_host = QWidget()
+        self.page_host.setObjectName("pdfPageHost")
+        self.page_layout = QVBoxLayout(self.page_host)
+        self.page_layout.setContentsMargins(0, 0, 0, 0)
+        self.page_layout.setSpacing(10)
         self.scroll = QScrollArea()
         self.scroll.setObjectName("pdfScroll")
         self.scroll.setWidgetResizable(False)
@@ -517,7 +1263,57 @@ class PdfReaderPanel(QFrame):
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_label.setMinimumSize(280, 180)
         self.scroll.setWidget(self.empty_label)
-        layout.addWidget(self.scroll, 1)
+        self.scroll.verticalScrollBar().valueChanged.connect(self.on_continuous_scroll)
+        self.reader_stack = QStackedWidget()
+        self.reader_stack.addWidget(self.native_view)
+        self.reader_stack.addWidget(self.scroll)
+        self.reader_stack.setCurrentWidget(self.scroll)
+        layout.addWidget(self.reader_stack, 1)
+        self.set_reference_mode(False)
+
+    def request_reference_edition(self, index: int) -> None:
+        edition = self.reference_box.itemData(index)
+        if edition:
+            self.reference_edition_requested.emit(str(edition))
+
+    def set_reference_mode(self, enabled: bool, edition: str = "") -> None:
+        self.reference_mode = enabled
+        self.return_primary.setVisible(enabled)
+        self.locate_button.setVisible(not enabled)
+        self.reference_fix.setVisible(enabled)
+        if edition:
+            index = self.reference_box.findData(edition)
+            if index >= 0 and index != self.reference_box.currentIndex():
+                self.reference_box.blockSignals(True)
+                self.reference_box.setCurrentIndex(index)
+                self.reference_box.blockSignals(False)
+        elif not enabled and self.reference_box.currentIndex() != 0:
+            self.reference_box.blockSignals(True)
+            self.reference_box.setCurrentIndex(0)
+            self.reference_box.blockSignals(False)
+        if not enabled:
+            self.reference_targets.setVisible(False)
+
+    def set_reference_targets(self, targets: list[dict], current: dict | None = None) -> None:
+        self.reference_targets.blockSignals(True)
+        self.reference_targets.clear()
+        for target in targets:
+            label = f"{clean_name(str(target.get('book', '')))} · 第 {target.get('page', 1)} 页 · {target.get('title', '')}"
+            self.reference_targets.addItem(label, target)
+        if current:
+            wanted = (current.get("book"), current.get("page"), current.get("title"))
+            for index in range(self.reference_targets.count()):
+                item = self.reference_targets.itemData(index)
+                if (item.get("book"), item.get("page"), item.get("title")) == wanted:
+                    self.reference_targets.setCurrentIndex(index)
+                    break
+        self.reference_targets.blockSignals(False)
+        self.reference_targets.setVisible(bool(targets))
+
+    def request_reference_target(self, index: int) -> None:
+        target = self.reference_targets.itemData(index)
+        if isinstance(target, dict):
+            self.reference_target_requested.emit(target)
 
     def set_message(self, message: str) -> None:
         self.empty_label.setText(message)
@@ -525,6 +1321,8 @@ class PdfReaderPanel(QFrame):
         self.capture_mode = False
         self.capture_bar.setVisible(False)
         self.crop_label.set_capture_enabled(False)
+        self.clear_continuous_pages()
+        self.reader_stack.setCurrentWidget(self.scroll)
 
     def open_document(self, path: Path, page: int, heading: str, highlight: dict | None = None) -> bool:
         if not path.exists():
@@ -585,11 +1383,17 @@ class PdfReaderPanel(QFrame):
             self.page_box.blockSignals(True)
             self.page_box.setValue(page)
             self.page_box.blockSignals(False)
-        self.render_page()
+        self.render_page(navigate=True)
 
     def on_zoom_changed(self, _value: int) -> None:
         self.fit_width_enabled = False
-        self.render_page()
+        self.schedule_render()
+
+    def set_continuous_mode(self, enabled: bool) -> None:
+        self.continuous_mode = enabled
+        self.continuous_toggle.setText("连续" if enabled else "单页")
+        if self.document.pageCount() and not self.capture_mode:
+            self.render_page()
 
     def fit_to_width(self) -> None:
         if not self.document.pageCount() or self.current_page < 1:
@@ -597,27 +1401,168 @@ class PdfReaderPanel(QFrame):
         point_size = self.document.pagePointSize(self.current_page - 1)
         if point_size.width() <= 0:
             return
-        available = max(220, self.scroll.viewport().width() - 18)
-        zoom = round(available * 100 / 1280)
         self.fit_width_enabled = True
-        self.zoom_box.blockSignals(True)
-        self.zoom_box.setValue(max(self.zoom_box.minimum(), min(self.zoom_box.maximum(), zoom)))
-        self.zoom_box.blockSignals(False)
-        self.render_page()
+        self.schedule_render()
 
-    def render_page(self) -> None:
-        if not self.document.pageCount() or self.current_page < 1:
+    def schedule_render(self) -> None:
+        if self.document.pageCount() and self.current_page >= 1:
+            self._render_timer.start()
+
+    def on_native_page_changed(self, page: int) -> None:
+        """原生连续阅读时，页码控件跟随当前可见页。"""
+        current = int(page) + 1
+        if current < 1 or current == self.current_page:
             return
-        point_size = self.document.pagePointSize(self.current_page - 1)
-        logical_width = max(220, round(1280 * self.zoom_box.value() / 100))
-        pixel_ratio = max(1.0, self.devicePixelRatioF())
+        self.current_page = current
+        self.page_box.blockSignals(True)
+        self.page_box.setValue(current)
+        self.page_box.blockSignals(False)
+
+    def refresh_reader_view(self) -> None:
+        self.render_page(navigate=False)
+
+    def apply_native_view_settings(self) -> None:
+        self.native_view.setPageMode(
+            QPdfView.PageMode.MultiPage if self.continuous_mode else QPdfView.PageMode.SinglePage
+        )
+        if self.fit_width_enabled:
+            self.native_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+        else:
+            self.native_view.setZoomMode(QPdfView.ZoomMode.Custom)
+            self.native_view.setZoomFactor(self.zoom_box.value() / 100.0)
+
+    def show_native_page(self, navigate: bool) -> None:
+        self.apply_native_view_settings()
+        self.reader_stack.setCurrentWidget(self.native_view)
+        if navigate:
+            # 原生视图负责整本连续滚动与定位，不再同步渲染/堆叠位图。
+            self.native_view.pageNavigator().jump(self.current_page - 1, QPointF(0, 0), self.native_view.zoomFactor())
+
+    def page_render_size(self, page: int) -> tuple[int, int, float]:
+        point_size = self.document.pagePointSize(page - 1)
+        if point_size.width() <= 0:
+            return 220, 300, 1.0
+        viewport_width = max(360, self.scroll.viewport().width() - 18)
+        # 100% 以当前阅读器可用宽度为基准，而不是固定渲染 1280px。
+        # 在窄栏/Retina 下固定宽度加三张高分图会瞬间占掉数百 MB。
+        base_width = min(840, viewport_width)
+        logical_width = viewport_width if self.fit_width_enabled else max(260, round(base_width * self.zoom_box.value() / 100))
+        # PDF 页在连续模式中保持逻辑像素渲染；避免按 Retina 倍率同时保留多张巨图。
+        pixel_ratio = 1.0
         render_width = round(logical_width * pixel_ratio)
         render_height = max(1, round(render_width * point_size.height() / point_size.width()))
-        image = self.document.render(self.current_page - 1, QSize(render_width, render_height))
+        return render_width, render_height, pixel_ratio
+
+    def render_image(self, page: int) -> tuple[QImage, int, int, float]:
+        render_width, render_height, pixel_ratio = self.page_render_size(page)
+        image = self.document.render(page - 1, QSize(render_width, render_height))
+        return image, render_width, render_height, pixel_ratio
+
+    def clear_continuous_pages(self) -> None:
+        self._continuous_labels.clear()
+        while self.page_layout.count():
+            item = self.page_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def continuous_page_label(self, page: int) -> QLabel:
+        image, width, height, pixel_ratio = self.render_image(page)
+        label = QLabel()
+        label.setObjectName("pdfContinuousPage")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = QPixmap.fromImage(image)
+        pixmap.setDevicePixelRatio(pixel_ratio)
+        label.setPixmap(pixmap)
+        label.setFixedSize(round(width / pixel_ratio), round(height / pixel_ratio))
+        label.setProperty("pdf_page", page)
+        return label
+
+    def add_continuous_page(self, page: int, before: bool = False) -> QLabel | None:
+        if page < 1 or page > self.document.pageCount() or page in self._continuous_labels:
+            return None
+        label = self.continuous_page_label(page)
+        if before:
+            self.page_layout.insertWidget(0, label)
+        else:
+            self.page_layout.addWidget(label)
+        self._continuous_labels[page] = label
+        return label
+
+    def render_continuous_window(self) -> None:
+        self._continuous_updating = True
+        self.clear_continuous_pages()
+        # 只准备当前页及下一页；上下滚到边缘时再惰性接入，避免一次渲染三张大页。
+        first = self.current_page
+        last = min(self.document.pageCount(), self.current_page + 1)
+        for page in range(first, last + 1):
+            self.add_continuous_page(page)
+        self.scroll.setWidget(self.page_host)
+        self._continuous_updating = False
+
+        def reveal_current() -> None:
+            label = self._continuous_labels.get(self.current_page)
+            if label is not None:
+                self.scroll.ensureWidgetVisible(label, 0, 6)
+
+        QTimer.singleShot(0, reveal_current)
+
+    def on_continuous_scroll(self, value: int) -> None:
+        if self._continuous_updating or not self.continuous_mode or self.capture_mode or not self._continuous_labels:
+            return
+        bar = self.scroll.verticalScrollBar()
+        pages = sorted(self._continuous_labels)
+        if bar.maximum() - value < 32 and pages[-1] < self.document.pageCount():
+            self.queue_continuous_extension(1)
+        elif value < 32 and pages[0] > 1:
+            self.queue_continuous_extension(-1)
+        # 让页码框跟随当前视口，不触发重新渲染。
+        viewport_top = bar.value()
+        current = min(
+            self._continuous_labels,
+            key=lambda page: abs(self._continuous_labels[page].y() + self._continuous_labels[page].height() // 2 - viewport_top),
+        )
+        if current != self.current_page:
+            self.current_page = current
+            self.page_box.blockSignals(True)
+            self.page_box.setValue(current)
+            self.page_box.blockSignals(False)
+
+    def queue_continuous_extension(self, direction: int) -> None:
+        if self._pending_continuous_direction:
+            return
+        self._pending_continuous_direction = direction
+        self._continuous_extend_timer.start()
+
+    def extend_continuous_pages(self) -> None:
+        direction = self._pending_continuous_direction
+        self._pending_continuous_direction = 0
+        if not direction or not self.continuous_mode or self.capture_mode or not self._continuous_labels:
+            return
+        pages = sorted(self._continuous_labels)
+        page = pages[-1] + 1 if direction > 0 else pages[0] - 1
+        if page < 1 or page > self.document.pageCount():
+            return
+        bar = self.scroll.verticalScrollBar()
+        original_value = bar.value()
+        self._continuous_updating = True
+        label = self.add_continuous_page(page, before=direction < 0)
+        self._continuous_updating = False
+        if direction < 0 and label is not None:
+            bar.setValue(original_value + label.height() + self.page_layout.spacing())
+
+    def render_page(self, navigate: bool = True) -> None:
+        if not self.document.pageCount() or self.current_page < 1:
+            return
+        if not self.capture_mode and not self.highlight_rect:
+            self.show_native_page(navigate)
+            return
+        image, _width, _height, pixel_ratio = self.render_image(self.current_page)
         self.crop_label.set_page_image(image, pixel_ratio)
         self.crop_label.set_capture_enabled(self.capture_mode)
         self.crop_label.set_highlight_normalized(self.highlight_rect)
         self.scroll.setWidget(self.crop_label)
+        self.reader_stack.setCurrentWidget(self.scroll)
 
     def _adjust_zoom(self, amount: int) -> None:
         if not amount:
@@ -625,7 +1570,7 @@ class PdfReaderPanel(QFrame):
         self.zoom_box.setValue(max(self.zoom_box.minimum(), min(self.zoom_box.maximum(), self.zoom_box.value() + amount)))
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
-        if watched is self.scroll.viewport():
+        if watched in {self.scroll.viewport(), self.native_view.viewport()}:
             if event.type() == QEvent.Type.Wheel and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 delta = event.angleDelta().y() or event.pixelDelta().y()
                 if delta:
@@ -642,6 +1587,11 @@ class PdfReaderPanel(QFrame):
                         return True
         return super().eventFilter(watched, event)
 
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if self.fit_width_enabled and self.document.pageCount() and not self.capture_mode:
+            self.schedule_render()
+
     def begin_capture(self) -> bool:
         if not self.document.pageCount():
             return False
@@ -650,6 +1600,8 @@ class PdfReaderPanel(QFrame):
         self.crop_label.set_capture_enabled(True)
         self.capture_bar.setVisible(True)
         self.capture_hint.setText(f"在第 {self.current_page} 页拖拽框选，确认后插入笔记")
+        # 框选必须对应唯一一张纸；临时切至当前页，取消后回到连续阅读。
+        self.render_page()
         return True
 
     def cancel_capture(self) -> None:
@@ -658,6 +1610,7 @@ class PdfReaderPanel(QFrame):
         self.capture_mode = False
         self.capture_bar.setVisible(False)
         self.crop_label.set_capture_enabled(False)
+        self.render_page()
         self.capture_cancelled.emit()
 
     def confirm_capture(self) -> None:
@@ -670,6 +1623,7 @@ class PdfReaderPanel(QFrame):
         self.capture_mode = False
         self.capture_bar.setVisible(False)
         self.crop_label.set_capture_enabled(False)
+        self.render_page()
         self.capture_confirmed.emit(image, page, rect)
 
 
@@ -1106,6 +2060,8 @@ def render_list_detail_document(key: str, entries: list[dict]) -> str:
                 for followup_index, item in enumerate(entry.get("followups", []), 1)
             )
             body = f"<div class='question-line'><strong>【问题{index}】</strong>{render_mixed_math_html(entry.get('question', ''), '')}</div>{followups}"
+        elif key == "other_references":
+            body = f"<div>{render_mixed_math_html(entry.get('content', ''), '暂无内容')}</div>"
         else:
             body = f"<h3>{index}. {render_mixed_math_html(entry.get('title', ''), '未命名项目')}</h3><div>{render_mixed_math_html(entry.get('content', ''), '暂无内容')}</div>"
         cards.append(f"<article>{body}</article>")
@@ -1703,6 +2659,28 @@ class TitleContentCard(BaseCard):
         return {"title": self.title.toPlainText().strip(), "content": self.content.toPlainText().strip()}
 
 
+class ReferenceContentCard(BaseCard):
+    """跨版本参考只保留一段内容；来源由插图元数据而非额外字段承担。"""
+    def __init__(self, item: dict, remove_callback, changed_callback, parent=None):
+        super().__init__(remove_callback, changed_callback, parent)
+        self.add_remove_row("")
+        self.content = FormulaTextEdit()
+        self.content.setPlainText(str(item.get("content", "")))
+        self.content.setPlaceholderText("")
+        self.content.setMinimumHeight(52)
+        self.layout_box.addWidget(self.content)
+        self.track(self.content)
+
+    def preview_text(self) -> str:
+        return self.content.toPlainText().strip()
+
+    def is_empty(self) -> bool:
+        return not self.content.toPlainText().strip()
+
+    def data(self) -> dict:
+        return {"content": self.content.toPlainText().strip()}
+
+
 def configure_compact_cell(field: FormulaTextEdit, minimum_width: int) -> None:
     """让紧凑列表的每一列既有可读下限，也能从 WebEngine 的首选宽度收缩。"""
     field.setMinimumWidth(minimum_width)
@@ -2168,6 +3146,26 @@ class NotebookSection(QFrame):
         dialog.exec()
 
 
+class SharedReferenceSection(NotebookSection):
+    """其他版本参考：正文极简，是否共享仅在栏目头部一处表达。"""
+    share_requested = Signal()
+
+    def __init__(self, on_change, parent=None):
+        super().__init__("other_references", ReferenceContentCard, on_change, parent)
+        self.view_all.setText("查看全部")
+        self.share = QPushButton("共享")
+        self.share.setObjectName("smallAction")
+        self.share.setToolTip("与对应的人教A版或苏教版小节共享本栏目")
+        self.share.clicked.connect(self.share_requested.emit)
+        # 加在添加按钮前，操作仍集中在右侧。
+        heading = self.layout().itemAt(0).layout()
+        heading.insertWidget(max(1, heading.count() - 1), self.share)
+
+    def set_share_state(self, shared: bool, peer_text: str = "") -> None:
+        self.share.setText("已共享" if shared else "共享")
+        self.share.setToolTip(peer_text or "与对应的人教A版或苏教版小节共享本栏目")
+
+
 class FixedTextSection(QFrame):
     def __init__(self, title: str, placeholder: str, on_change, parent=None):
         super().__init__(parent)
@@ -2198,6 +3196,7 @@ def section_heading(text: str) -> QLabel:
 
 class LessonNotebook(QWidget):
     open_pdf_requested = Signal()
+    shared_reference_requested = Signal()
 
     def __init__(self, on_change):
         super().__init__()
@@ -2209,7 +3208,9 @@ class LessonNotebook(QWidget):
             "examples": NotebookSection("examples", ExampleCard, on_change),
             "questions": NotebookSection("questions", QuestionCard, on_change),
             "pitfalls": NotebookSection("pitfalls", TitleContentCard, on_change),
+            "other_references": SharedReferenceSection(on_change),
         }
+        self.sections["other_references"].share_requested.connect(self.shared_reference_requested.emit)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 18)
         layout.setSpacing(12)
@@ -2232,7 +3233,7 @@ class LessonNotebook(QWidget):
         anchor_layout.setContentsMargins(4, 2, 4, 0)
         anchor_layout.setSpacing(0)
         self.anchors: dict[str, QPushButton] = {}
-        anchors = [("intro", "引言"), ("knowledge", "知识点"), ("patterns", "题型"), ("examples", "例题"), ("questions", "问题串"), ("pitfalls", "易错"), ("lesson", "课后备注")]
+        anchors = [("intro", "引言"), ("knowledge", "知识点"), ("patterns", "题型"), ("examples", "例题"), ("questions", "问题串"), ("pitfalls", "易错"), ("other_references", "其他参考"), ("lesson", "课后备注")]
         for key, text in anchors:
             button = QPushButton(text)
             button.setObjectName("anchorButton")
@@ -2272,7 +3273,7 @@ class LessonNotebook(QWidget):
         if self.scroll_area:
             QTimer.singleShot(0, lambda: self.scroll_area.ensureWidgetVisible(target, 0, 10))
 
-    def set_lesson(self, lesson: dict, note: dict) -> None:
+    def set_lesson(self, lesson: dict, note: dict, shared_references: list[dict] | None = None, shared_peer: str = "") -> None:
         self.title.setText(f"{lesson['section_no']}  {lesson['section_title']}")
         reference = lesson.get("pdf_reference", {})
         page_text = f"第 {reference.get('start', '—')}–{reference.get('end', '—')} 页"
@@ -2289,7 +3290,9 @@ class LessonNotebook(QWidget):
         normalized = normalize_note(note)
         self.intro_note.set_text(normalized["intro_note"])
         for key, section in self.sections.items():
-            section.set_data(normalized[key])
+            section.set_data(shared_references or [] if key == "other_references" else normalized[key])
+        reference_section = self.sections["other_references"]
+        reference_section.set_share_state(bool(shared_peer), shared_peer)
         self.lesson_note.set_text(normalized["lesson_note"])
         # 初次进入小节从顶部开始阅读；只展开知识点，不复用会滚动定位的锚点动作。
         for key, section in self.sections.items():
@@ -2311,6 +3314,9 @@ class LessonNotebook(QWidget):
             "pitfalls": self.sections["pitfalls"].values(),
             "lesson_note": self.lesson_note.text(),
         }
+
+    def shared_reference_values(self) -> list[dict]:
+        return self.sections["other_references"].values()
 
 
 class ChapterNotebook(QWidget):
@@ -2406,6 +3412,48 @@ class ChapterNotebook(QWidget):
 
 class SidebarTree(QTreeWidget):
     """自绘浅色展开箭头，避免深色目录沿用系统黑色分支图标。"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._branch_click_active = False
+
+    def _is_branch_hit(self, position) -> bool:
+        item = self.itemAt(position)
+        if item is None or item.childCount() <= 0:
+            return False
+        item_rect = self.visualItemRect(item)
+        branch_rect = QRect(
+            max(0, item_rect.left() - self.indentation()), item_rect.top(),
+            self.indentation(), item_rect.height(),
+        )
+        return branch_rect.contains(position)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        """箭头只负责展开；标题才负责切换右侧的章/节页面。"""
+        position = event.position().toPoint()
+        item = self.itemAt(position)
+        self._branch_click_active = False
+        if event.button() == Qt.MouseButton.LeftButton and item is not None and self._is_branch_hit(position):
+            item.setExpanded(not item.isExpanded())
+            # QTreeWidget 在 mouseRelease 中仍会处理默认分支动作；必须把整次
+            # 按下/松开手势都消费掉，不能只截获 press。
+            self._branch_click_active = True
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if self._branch_click_active and event.button() == Qt.MouseButton.LeftButton:
+            self._branch_click_active = False
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
+        if self._is_branch_hit(event.position().toPoint()):
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def drawBranches(self, painter: QPainter, rect: QRect, index: QModelIndex) -> None:  # type: ignore[override]
         if not self.model().hasChildren(index):
             return
@@ -2440,6 +3488,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
+        if APP_ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.resize(1360, 880)
         self.setMinimumSize(960, 640)
         self.storage = NotebookStorage()
@@ -2465,18 +3515,33 @@ class MainWindow(QMainWindow):
         self.lock_timer.timeout.connect(self.refresh_current_lock)
         self.source_root = find_source_root()
         self.pdf_index = PdfReferenceIndex()
+        self.reference_index = ReferenceTextbookIndex(self.pdf_index)
         self.lessons = self.load_catalog()
         self.chapter_notes: dict[str, dict] = {}
         self.section_notes: dict[str, dict] = {}
         self.custom_subsections: dict[str, list[dict]] = {}
+        self.reference_mappings: dict[str, dict[str, list[dict]]] = {}
+        self.shared_reference_groups: dict[str, dict] = {}
         self.notes = self.load_notes()
         self.current_id: str | None = None
         self.current_lesson: dict | None = None
         self.current_node_type = "lesson"
         self.current_chapter: dict | None = None
+        # 目录切换非常频繁。只有编辑区实际发生了变化才落盘，避免每次点目录都
+        # 同步写完整 JSON 并阻塞界面。
+        self.current_editor_fingerprint = ""
         self.pending_screenshot_field: FormulaTextEdit | None = None
         self.pending_screenshot_context: dict | None = None
+        self.active_reference_target: dict | None = None
         self.loading = False
+        self.tree_refresh_timer = QTimer(self)
+        self.tree_refresh_timer.setSingleShot(True)
+        self.tree_refresh_timer.setInterval(160)
+        self.tree_refresh_timer.timeout.connect(self.populate_tree)
+        self.reader_locate_timer = QTimer(self)
+        self.reader_locate_timer.setSingleShot(True)
+        self.reader_locate_timer.setInterval(70)
+        self.reader_locate_timer.timeout.connect(self._deferred_locate_current_in_reader)
         self.build_ui()
         FormulaTextEdit.screenshot_request_handler = self.capture_textbook_screenshot
         FormulaTextEdit.screenshot_open_handler = self.open_screenshot_source
@@ -2545,6 +3610,8 @@ class MainWindow(QMainWindow):
             self.chapter_notes = {}
             self.section_notes = {}
             self.custom_subsections = {}
+            self.reference_mappings = {}
+            self.shared_reference_groups = {}
             return {}
         try:
             payload = json.loads(source.read_text(encoding="utf-8"))
@@ -2553,12 +3620,16 @@ class MainWindow(QMainWindow):
             self.chapter_notes = payload.get("chapter_notes", {}) if isinstance(payload.get("chapter_notes", {}), dict) else {}
             self.section_notes = payload.get("section_notes", {}) if isinstance(payload.get("section_notes", {}), dict) else {}
             self.custom_subsections = payload.get("custom_subsections", {}) if isinstance(payload.get("custom_subsections", {}), dict) else {}
+            self.reference_mappings = payload.get("reference_mappings", {}) if isinstance(payload.get("reference_mappings", {}), dict) else {}
+            self.shared_reference_groups = payload.get("shared_reference_groups", {}) if isinstance(payload.get("shared_reference_groups", {}), dict) else {}
         except (OSError, json.JSONDecodeError):
             self.notes_revision = 0
             self.notes_fingerprint = ""
             self.chapter_notes = {}
             self.section_notes = {}
             self.custom_subsections = {}
+            self.reference_mappings = {}
+            self.shared_reference_groups = {}
             return {}
         self.notes_fingerprint = self.storage.fingerprint(source)
         self.migrate_chapter_note_keys()
@@ -2576,7 +3647,7 @@ class MainWindow(QMainWindow):
         sync_menu.addAction(QAction("解除过期锁", self, triggered=self.clear_expired_locks))
         tools_menu = bar.addMenu("工具")
         tools_menu.addAction(QAction("用系统工具打开当前教材", self, triggered=self.open_current_pdf))
-        tools_menu.addAction(QAction("跨版本定位", self, triggered=self.show_comparison))
+        tools_menu.addAction(QAction("对比阅读", self, triggered=self.show_comparison))
         tools_menu.addAction(QAction("导出当前小节笔记…", self, triggered=self.export_current_note))
         help_menu = bar.addMenu("说明")
         help_menu.addAction(QAction("LaTeX 输入说明", self, triggered=self.show_latex_help))
@@ -2648,11 +3719,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.progress)
         self.search = QLineEdit()
         self.search.setPlaceholderText("搜索小节或笔记内容…")
-        self.search.textChanged.connect(self.populate_tree)
+        self.search.textChanged.connect(self.schedule_tree_refresh)
         layout.addWidget(self.search)
         self.edition = SidebarComboBox()
         self.edition.addItems(["全部教材", "人教A版", "苏教版", "仅已有笔记"])
-        self.edition.currentTextChanged.connect(self.populate_tree)
+        self.edition.currentTextChanged.connect(self.schedule_tree_refresh)
         layout.addWidget(self.edition)
         self.tree = SidebarTree()
         self.tree.setHeaderHidden(True)
@@ -2668,6 +3739,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
         self.editor = LessonNotebook(self.save_current)
         self.editor.open_pdf_requested.connect(self.open_current_in_reader)
+        self.editor.shared_reference_requested.connect(self.confirm_shared_reference)
         self.context_bar = QFrame()
         self.context_bar.setObjectName("contextBar")
         context = QHBoxLayout(self.context_bar)
@@ -2683,6 +3755,11 @@ class MainWindow(QMainWindow):
         path_box.addWidget(self.context_detail)
         context.addLayout(path_box)
         context.addWidget(self.editor.anchor_bar, 1)
+        self.comparison_button = QPushButton("对比阅读")
+        self.comparison_button.setObjectName("smallAction")
+        self.comparison_button.setToolTip("并列查看七个版本中置信度最高的对应内容")
+        self.comparison_button.clicked.connect(self.show_comparison)
+        context.addWidget(self.comparison_button)
         self.reader_toggle_button = QPushButton("收起教材")
         self.reader_toggle_button.setObjectName("primaryCompact")
         self.reader_toggle_button.clicked.connect(self.toggle_pdf_reader)
@@ -2704,6 +3781,10 @@ class MainWindow(QMainWindow):
         self.pdf_reader = PdfReaderPanel()
         self.pdf_reader.setMinimumWidth(330)
         self.pdf_reader.locate_requested.connect(self.open_current_in_reader)
+        self.pdf_reader.reference_edition_requested.connect(self.open_reference_edition)
+        self.pdf_reader.reference_target_requested.connect(self.open_reference_target)
+        self.pdf_reader.reference_correction_requested.connect(self.correct_reference_location)
+        self.pdf_reader.return_to_primary_requested.connect(self.return_to_primary_reader)
         self.pdf_reader.capture_confirmed.connect(self.complete_reader_capture)
         self.pdf_reader.capture_cancelled.connect(self.cancel_reader_capture)
         self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -2804,6 +3885,94 @@ class MainWindow(QMainWindow):
         self.context_label.setText(title)
         self.context_detail.setText(f"{self.current_lesson['edition']} · {clean_name(self.current_lesson['file'])} · {self.current_lesson['chapter']}")
 
+    def reference_targets_for_current(self, edition: str) -> list[dict]:
+        if not self.current_lesson or self.current_node_type != "lesson":
+            return []
+        saved = self.reference_mappings.get(self.current_id or "", {}).get(edition, [])
+        confirmed = [entry for entry in saved if isinstance(entry, dict) and entry.get("confirmed")]
+        if confirmed:
+            return confirmed
+        # 跨版本的编排和粒度都不一致。未确认时，只接受目录题名完全一致的
+        # 结果；“集合”与“集合的概念与表示”之类相近标题仅放在修正窗口中，
+        # 绝不擅自建立映射或跳转。
+        return [item for item in self.reference_index.candidates(self.current_lesson, edition) if int(item.get("score", 0)) >= 320]
+
+    def open_reference_edition(self, edition: str) -> None:
+        if not self.current_lesson or self.current_node_type != "lesson":
+            self.status_label.setText("请选择一个具体小节后再打开参考版本")
+            return
+        saved = self.reference_mappings.get(self.current_id or "", {}).get(edition, [])
+        targets = self.reference_targets_for_current(edition)
+        if not targets:
+            root = PDF_ROOTS.get(edition, Path())
+            if not root.exists():
+                root = self.ensure_pdf_for_metadata({"edition": edition, "book": ""})
+                if root is None:
+                    self.pdf_reader.set_message(f"未找到 {edition} 教材；可在“修正定位”中选择本机目录。")
+                    return
+                self.reference_index.invalidate()
+                targets = self.reference_targets_for_current(edition)
+            if not targets:
+                message = (f"{edition} 尚未确认与当前内容对应的小节。请点击“修正定位”按标题选择；"
+                           "不会再按节次号或跳转到封面。")
+                if PdfReader is None:
+                    message = f"{edition} 需要正文索引组件。请安装 pypdf 后重启应用。"
+                self.pdf_reader.set_message(message)
+                return
+        target = dict(targets[0])
+        path = self.ensure_pdf_for_metadata(target)
+        if path is None or not path.exists():
+            self.pdf_reader.set_message(f"本机尚未配置 {edition} 的《{clean_name(target.get('book', ''))}》")
+            return
+        self.set_pdf_reader_visible(True)
+        detail = f"{edition} · {target.get('title') or clean_name(path.name)}"
+        if self.pdf_reader.open_document(path, int(target.get("page") or 1), detail):
+            self.active_reference_target = target
+            self.pdf_reader.set_reference_mode(True, edition)
+            self.pdf_reader.set_reference_targets(targets, target)
+            suffix = "已确认定位" if any(isinstance(item, dict) and item.get("confirmed") for item in saved) else "标题候选，尚未确认"
+            self.status_label.setText(f"正在参考 {edition}：{target.get('title') or clean_name(path.name)}（{suffix}）")
+
+    def open_reference_target(self, target: dict) -> None:
+        if not isinstance(target, dict):
+            return
+        path = self.ensure_pdf_for_metadata(target)
+        if path is None or not path.exists():
+            return
+        detail = f"{target.get('edition')} · {target.get('title') or clean_name(path.name)}"
+        if self.pdf_reader.open_document(path, int(target.get("page") or 1), detail):
+            self.active_reference_target = target
+            self.pdf_reader.set_reference_mode(True, str(target.get("edition") or ""))
+            self.status_label.setText(f"正在参考 {target.get('edition')}：{target.get('title') or clean_name(path.name)}")
+
+    def return_to_primary_reader(self) -> None:
+        self.active_reference_target = None
+        self.pdf_reader.set_reference_mode(False)
+        if self.locate_current_in_reader():
+            self.status_label.setText("已返回当前教材")
+
+    def correct_reference_location(self) -> None:
+        if not self.current_lesson or self.current_node_type != "lesson" or not self.current_id:
+            return
+        dialog = ReferenceLocationDialog(self.current_lesson, self.reference_index, self.reference_mappings.get(self.current_id, {}), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        # 只有用户在“修正定位”窗口确认过的条目才会成为自动打开依据。
+        # 旧版曾按节次号生成的映射保留在文件中，但不会继续误导跳转。
+        cleaned = {
+            edition: [dict(entry, confirmed=True) for entry in entries if isinstance(entry, dict)]
+            for edition, entries in dialog.mapping.items() if entries
+        }
+        if cleaned:
+            self.reference_mappings[self.current_id] = cleaned
+        else:
+            self.reference_mappings.pop(self.current_id, None)
+        self.write_notes()
+        edition = self.pdf_reader.reference_box.currentData()
+        if edition:
+            self.open_reference_edition(str(edition))
+        self.status_label.setText("已保存参考教材定位")
+
     def locate_current_in_reader(self) -> bool:
         target = self.current_pdf_target()
         if not target:
@@ -2811,6 +3980,8 @@ class MainWindow(QMainWindow):
             return False
         reference, page, detail = target
         path = Path(reference.get("path", ""))
+        self.active_reference_target = None
+        self.pdf_reader.set_reference_mode(False)
         return self.pdf_reader.open_document(path, page, detail)
 
     def open_current_in_reader(self) -> None:
@@ -2850,13 +4021,13 @@ class MainWindow(QMainWindow):
         edition = str(metadata.get("edition") or "")
         book = str(metadata.get("book") or "")
         path = PDF_ROOTS.get(edition, Path()) / book
-        if path.exists():
+        if book and path.exists():
             return path
-        if not edition or not book:
+        if not edition:
             return None
         choice = QMessageBox.question(
             self, "需要本机教材目录",
-            f"本机未找到 {edition} 的《{clean_name(book)}》。\n是否选择该版本教材所在文件夹？",
+            f"本机未找到 {edition}{f' 的《{clean_name(book)}》' if book else ''}。\n是否选择该版本教材所在文件夹？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
@@ -2868,7 +4039,8 @@ class MainWindow(QMainWindow):
         PDF_ROOTS[edition] = Path(folder)
         self.storage.settings.setValue(f"pdf_roots/{edition}", folder)
         self.pdf_index = PdfReferenceIndex()
-        return PDF_ROOTS[edition] / book
+        self.reference_index = ReferenceTextbookIndex(self.pdf_index)
+        return PDF_ROOTS[edition] / book if book else PDF_ROOTS[edition]
 
     def open_screenshot_source(self, screenshot_id: str) -> None:
         metadata_path = SCREENSHOT_DIR / f"{screenshot_id}.json"
@@ -2885,6 +4057,13 @@ class MainWindow(QMainWindow):
         self.set_pdf_reader_visible(True)
         title = f"截图来源 · 教材第 {page} 页"
         if self.pdf_reader.open_document(path, page, title, metadata.get("crop_rect")):
+            edition = str(metadata.get("edition") or "")
+            if edition in REFERENCE_EDITIONS:
+                self.active_reference_target = {"edition": edition, "book": metadata.get("book", ""), "page": page, "title": metadata.get("bookmark", "")}
+                self.pdf_reader.set_reference_mode(True, edition)
+            else:
+                self.active_reference_target = None
+                self.pdf_reader.set_reference_mode(False)
             self.status_label.setText(f"已定位截图来源：教材第 {page} 页")
 
     @staticmethod
@@ -2897,6 +4076,9 @@ class MainWindow(QMainWindow):
     @staticmethod
     def note_text(note: dict) -> str:
         return json.dumps(normalize_note(note), ensure_ascii=False).lower()
+
+    def lesson_has_any_content(self, lesson_id: str, note: dict | None = None) -> bool:
+        return self.has_content(note if note is not None else self.notes.get(lesson_id, {})) or bool(self.shared_reference_entries(lesson_id))
 
     def configure_sync_watcher(self) -> None:
         """坚果云写入本地目录后会触发这里；QSaveFile 替换文件后需重新登记路径。"""
@@ -3029,19 +4211,21 @@ class MainWindow(QMainWindow):
             return False
         if not self.storage.enabled:
             return True
-        if self.held_lock_id == self.current_id:
+        # 已共享的参考栏目使用同一把锁，避免人教 A / 苏教两端同时改一份共享条目。
+        lock_id = f"reference-group|{self.shared_group_id_for(self.current_id)}" if self.shared_group_id_for(self.current_id) else self.current_id
+        if self.held_lock_id == lock_id:
             return True
         # 开始编辑前总是先读取坚果云已经落地的最新版本。
         if self.storage.fingerprint(data_path()) != self.notes_fingerprint:
             self.reload_from_sync()
-        ok, lock = self.storage.acquire_lock(self.current_id)
+        ok, lock = self.storage.acquire_lock(lock_id)
         if not ok:
             owner = str((lock or {}).get("device_name") or "另一台电脑")
             expires = str((lock or {}).get("expires_at") or "稍后")
             self.status_label.setText(f"{owner} 正在编辑本节")
             QMessageBox.information(self, "本节正在编辑", f"{owner} 正在编辑这一节。\n锁会在对方切换小节、关闭应用或 {expires} 到期后释放。")
             return False
-        self.held_lock_id = self.current_id
+        self.held_lock_id = lock_id
         self.external_change_pending = False
         self.lock_timer.start()
         self.status_label.setText("正在编辑本节（已同步锁定）")
@@ -3107,9 +4291,15 @@ class MainWindow(QMainWindow):
             return False
         return True
 
+    def schedule_tree_refresh(self, *_args) -> None:
+        """搜索输入期间只在停顿后重建目录，避免每个字符都阻塞界面。"""
+        self.tree_refresh_timer.start()
+
     def populate_tree(self) -> None:
         if not hasattr(self, "tree"):
             return
+        self.tree.setUpdatesEnabled(False)
+        self.tree.blockSignals(True)
         self.tree.clear()
         self.node_index: dict[str, dict] = {}
         selected_edition = self.edition.currentText()
@@ -3122,9 +4312,12 @@ class MainWindow(QMainWindow):
             chapter_has_content = bool(chapter_data.get("note") or chapter_data.get("review"))
             if selected_edition in {"人教A版", "苏教版"} and lesson["edition"] != selected_edition:
                 return False
-            if selected_edition == "仅已有笔记" and not (self.has_content(note) or chapter_has_content):
+            if selected_edition == "仅已有笔记" and not (self.lesson_has_any_content(lesson["id"], note) or chapter_has_content):
                 return False
-            haystack = f"{lesson['section_no']} {lesson['section_title']} {lesson['chapter']} {lesson['file']} {self.note_text(note)} {json.dumps(chapter_data, ensure_ascii=False)}".lower()
+            # 未检索时不再把每一节的大段笔记序列化为 JSON；这曾是目录切换卡顿的主因。
+            if not query:
+                return True
+            haystack = f"{lesson['section_no']} {lesson['section_title']} {lesson['chapter']} {lesson['file']} {self.note_text(note)} {json.dumps(self.shared_reference_entries(lesson['id']), ensure_ascii=False)} {json.dumps(chapter_data, ensure_ascii=False)}".lower()
             return query in haystack
 
         groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
@@ -3154,7 +4347,7 @@ class MainWindow(QMainWindow):
                 # 每一节均直接承载完整笔记；不再拆出三级“小小节”，目录保持清爽。
                 for lesson in sorted(entries, key=lambda entry: tuple(int(part) for part in re.findall(r"\d+", entry["section_no"]))):
                     self.node_index[lesson["id"]] = {**lesson, "node_type": "lesson"}
-                    prefix = "● " if self.has_content(self.notes.get(lesson["id"], {})) else ""
+                    prefix = "● " if self.lesson_has_any_content(lesson["id"]) else ""
                     section_item = QTreeWidgetItem([prefix + f"{lesson['section_no']}  {lesson['section_title']}"])
                     section_item.setData(0, Qt.ItemDataRole.UserRole, lesson["id"])
                     if prefix:
@@ -3166,6 +4359,8 @@ class MainWindow(QMainWindow):
                 review = QTreeWidgetItem(["章节总复习"])
                 review.setData(0, Qt.ItemDataRole.UserRole, review_id)
                 chapter_item.addChild(review)
+        self.tree.blockSignals(False)
+        self.tree.setUpdatesEnabled(True)
 
     def on_tree_click(self, item: QTreeWidgetItem) -> None:
         node_id = item.data(0, Qt.ItemDataRole.UserRole)
@@ -3183,6 +4378,88 @@ class MainWindow(QMainWindow):
         self.loading = False
         self.status_label.setText(f"正在整理：{item.text(0).lstrip('● ').strip()}")
 
+    def shared_group_id_for(self, lesson_id: str) -> str | None:
+        for group_id, group in self.shared_reference_groups.items():
+            if lesson_id in group.get("members", []):
+                return group_id
+        return None
+
+    def shared_reference_entries(self, lesson_id: str) -> list[dict]:
+        group_id = self.shared_group_id_for(lesson_id)
+        if not group_id:
+            return []
+        entries = self.shared_reference_groups.get(group_id, {}).get("entries", [])
+        return entries if isinstance(entries, list) else []
+
+    def shared_reference_peer_label(self, lesson_id: str) -> str:
+        group_id = self.shared_group_id_for(lesson_id)
+        if not group_id:
+            return ""
+        peers = [item for item in self.shared_reference_groups.get(group_id, {}).get("members", []) if item != lesson_id]
+        peer = next((entry for entry in self.lessons if entry["id"] in peers), None)
+        return f"与 {peer['edition']} {peer['section_no']} 共享" if peer else ""
+
+    def _default_shared_peer(self, lesson: dict) -> dict | None:
+        other = "苏教版" if lesson.get("edition") == "人教A版" else "人教A版" if lesson.get("edition") == "苏教版" else ""
+        if not other:
+            return None
+        choices = [entry for entry in self.lessons if entry.get("edition") == other]
+        if not choices:
+            return None
+        return max(choices, key=lambda entry: reference_similarity(
+            str(lesson.get("section_title") or ""), str(entry.get("section_title") or "")
+        ))
+
+    def confirm_shared_reference(self) -> None:
+        if not self.current_lesson or self.current_node_type != "lesson" or not self.current_id:
+            return
+        lesson = self.current_lesson
+        other = "苏教版" if lesson.get("edition") == "人教A版" else "人教A版" if lesson.get("edition") == "苏教版" else ""
+        candidates = [entry for entry in self.lessons if entry.get("edition") == other]
+        candidates.sort(key=lambda entry: reference_similarity(
+            str(lesson.get("section_title") or ""), str(entry.get("section_title") or "")
+        ), reverse=True)
+        if not candidates:
+            QMessageBox.information(self, "暂无法建立共享", "当前小节没有找到另一主教材中的候选小节。")
+            return
+        dialog = SharedReferencePeerDialog(lesson, candidates[:24], self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.selected:
+            return
+        peer = dialog.selected
+        choice = QMessageBox.question(self, "确认共享参考", "两侧已有内容将按现有顺序合并，不会覆盖。是否继续？",
+                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes)
+        if choice != QMessageBox.StandardButton.Yes:
+            return
+        own_id, peer_id = self.current_id, peer["id"]
+        own_group = self.shared_group_id_for(own_id)
+        peer_group = self.shared_group_id_for(peer_id)
+        visible_entries = self.editor.shared_reference_values()
+        if own_group and peer_group and own_group != peer_group:
+            own_entries = self.shared_reference_entries(own_id)
+            peer_entries = self.shared_reference_entries(peer_id)
+            self.shared_reference_groups[own_group]["entries"] = own_entries + peer_entries
+            self.shared_reference_groups[own_group]["members"] = list(dict.fromkeys(self.shared_reference_groups[own_group].get("members", []) + self.shared_reference_groups[peer_group].get("members", [])))
+            self.shared_reference_groups.pop(peer_group, None)
+            group_id = own_group
+        elif own_group:
+            group_id = own_group
+            self.shared_reference_groups[group_id]["members"] = list(dict.fromkeys(self.shared_reference_groups[group_id].get("members", []) + [peer_id]))
+        elif peer_group:
+            group_id = peer_group
+            self.shared_reference_groups[group_id]["members"] = list(dict.fromkeys(self.shared_reference_groups[group_id].get("members", []) + [own_id]))
+            if visible_entries:
+                self.shared_reference_groups[group_id]["entries"] = visible_entries + self.shared_reference_entries(peer_id)
+        else:
+            group_id = uuid.uuid4().hex
+            self.shared_reference_groups[group_id] = {"members": [own_id, peer_id], "entries": visible_entries, "created_at": now()}
+        # 共享组刚建立时，原先的小节锁不再适用；下一次编辑会申请共享组锁。
+        self.release_current_lock()
+        self.write_notes()
+        self.loading = True
+        self.show_current_node()
+        self.loading = False
+        self.status_label.setText(f"已与 {peer['edition']} {peer['section_no']} 共享其他版本参考")
+
     def show_current_node(self) -> None:
         if not self.current_lesson or not self.current_id:
             return
@@ -3195,14 +4472,43 @@ class MainWindow(QMainWindow):
             self.chapter_editor.set_chapter(self.current_lesson, self.chapter_notes.get(chapter_id, {}), review_mode=True)
             self.editor_stack.setCurrentWidget(self.chapter_editor)
         else:
-            self.editor.set_lesson(self.current_lesson, self.notes.get(self.current_id, {}))
+            self.editor.set_lesson(self.current_lesson, self.notes.get(self.current_id, {}),
+                                   self.shared_reference_entries(self.current_id),
+                                   self.shared_reference_peer_label(self.current_id))
             self.editor_stack.setCurrentWidget(self.editor)
         self.update_context_bar()
+        if hasattr(self, "comparison_button"):
+            self.comparison_button.setEnabled(self.current_node_type == "lesson")
+        self.current_editor_fingerprint = self.editor_state_fingerprint()
+        if self.pdf_reader.isVisible() and not self.pdf_reader.capture_mode:
+            # 连续快速点目录时仅渲染最后一次选择，先让中间笔记区立即响应。
+            self.reader_locate_timer.start()
+
+    def _deferred_locate_current_in_reader(self) -> None:
         if self.pdf_reader.isVisible() and not self.pdf_reader.capture_mode:
             self.locate_current_in_reader()
 
+    def editor_state_fingerprint(self) -> str:
+        """只描述当前可编辑内容，不包含保存时间等派生字段。"""
+        if not self.current_id:
+            return ""
+        if self.current_node_type == "chapter":
+            payload = {"mode": "chapter", "data": self.chapter_editor.chapter_data()}
+        elif self.current_node_type == "review":
+            payload = {"mode": "review", "data": self.chapter_editor.review_data()}
+        else:
+            payload = {
+                "mode": "lesson",
+                "data": self.editor.note(),
+                "shared_references": self.editor.shared_reference_values(),
+            }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
     def save_current(self) -> None:
         if self.loading or not self.current_id:
+            return
+        editor_fingerprint = self.editor_state_fingerprint()
+        if editor_fingerprint == self.current_editor_fingerprint:
             return
         if self.current_node_type == "chapter":
             data = self.chapter_editor.chapter_data()
@@ -3222,6 +4528,15 @@ class MainWindow(QMainWindow):
                 self.notes[self.current_id] = note
             else:
                 self.notes.pop(self.current_id, None)
+            group_id = self.shared_group_id_for(self.current_id)
+            entries = self.editor.shared_reference_values()
+            if group_id:
+                self.shared_reference_groups[group_id]["entries"] = entries
+                self.shared_reference_groups[group_id]["updated_at"] = now()
+            elif entries:
+                group_id = uuid.uuid4().hex
+                self.shared_reference_groups[group_id] = {"members": [self.current_id], "entries": entries, "created_at": now()}
+        self.current_editor_fingerprint = editor_fingerprint
         self.write_notes()
         self.update_progress()
 
@@ -3234,7 +4549,7 @@ class MainWindow(QMainWindow):
         disk_payload = self.storage.read_json(path)
         disk_revision = int(disk_payload.get("revision", 0) or 0)
         payload = {
-            "version": 5,
+            "version": 6,
             "revision": max(self.notes_revision, disk_revision) + 1,
             "updated_at": now(),
             "updated_by": self.storage.device_name if self.storage.enabled else "本机",
@@ -3242,6 +4557,8 @@ class MainWindow(QMainWindow):
             "chapter_notes": self.chapter_notes,
             "section_notes": self.section_notes,
             "custom_subsections": self.custom_subsections,
+            "reference_mappings": self.reference_mappings,
+            "shared_reference_groups": self.shared_reference_groups,
         }
         try:
             self.storage.write_json(path, payload)
@@ -3274,6 +4591,7 @@ class MainWindow(QMainWindow):
         PDF_ROOTS[edition] = Path(folder)
         self.storage.settings.setValue(f"pdf_roots/{edition}", folder)
         self.pdf_index = PdfReferenceIndex()
+        self.reference_index = ReferenceTextbookIndex(self.pdf_index)
         refreshed = self.load_catalog()
         refreshed_lesson = next((entry for entry in refreshed if entry["id"] == self.current_id), None)
         if refreshed_lesson:
@@ -3291,10 +4609,25 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "当前没有对应教材页", "章页与章节总复习请使用“插入本机图片”；教材框选截图请在具体小节中使用。")
             field.cancel_external_capture()
             return None
-        if not self.ensure_local_pdf_root():
-            field.cancel_external_capture()
-            return None
         reference = self.current_lesson.get("pdf_reference", {})
+        context = dict(self.current_lesson)
+        # 阅读器正在查看参考版本时，框选内容自然来自该版本；其余情况仍来自当前主教材。
+        target = self.active_reference_target if self.pdf_reader.reference_mode else None
+        if target:
+            pdf_path = self.ensure_pdf_for_metadata(target)
+            if pdf_path is None or not pdf_path.exists():
+                field.cancel_external_capture()
+                return None
+            context.update({"edition": target["edition"], "file": target["book"], "bookmark": target.get("title", ""),
+                            "pdf_reference": {"start": int(target.get("page") or 1), "end": int(target.get("page") or 1), "path": pdf_path},
+                            "source_lesson_id": self.current_lesson["id"]})
+            reference = context["pdf_reference"]
+        else:
+            if not self.ensure_local_pdf_root():
+                field.cancel_external_capture()
+                return None
+        if not reference.get("path") or not Path(reference["path"]).exists():
+            reference = context.get("pdf_reference", {})
         if not reference.get("path") or not Path(reference["path"]).exists():
             QMessageBox.warning(self, "找不到教材 PDF", f"未找到本节关联的教材文件：\n{reference.get('path', '—')}")
             field.cancel_external_capture()
@@ -3302,9 +4635,9 @@ class MainWindow(QMainWindow):
         if self.pending_screenshot_field and self.pending_screenshot_field is not field:
             self.pending_screenshot_field.cancel_external_capture()
         self.pending_screenshot_field = field
-        self.pending_screenshot_context = dict(self.current_lesson)
+        self.pending_screenshot_context = context
         self.set_pdf_reader_visible(True)
-        detail = f"{self.current_lesson['section_no']} {self.current_lesson['section_title']} · 框选教材截图"
+        detail = f"{context.get('edition')} · {context.get('bookmark') or self.current_lesson['section_title']} · 框选教材截图"
         if not self.pdf_reader.open_document(Path(reference["path"]), int(reference.get("start") or 1), detail):
             self.pending_screenshot_field = None
             self.pending_screenshot_context = None
@@ -3340,10 +4673,12 @@ class MainWindow(QMainWindow):
             "book": context["file"],
             "page": page,
             "section_range": [reference["start"], reference["end"]],
-            "lesson_id": context["id"],
+            "lesson_id": context.get("source_lesson_id") or context["id"],
             "crop_rect": crop_rect,
             "created_at": now(),
         }
+        if context.get("bookmark"):
+            metadata["bookmark"] = context["bookmark"]
         (SCREENSHOT_DIR / f"{screenshot_id}.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         self.pending_screenshot_field = None
         self.pending_screenshot_context = None
@@ -3395,7 +4730,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"已调用系统 PDF 工具：第 {reference.get('start', 1)} 页")
 
     def update_progress(self) -> None:
-        count = sum(self.has_content(note) for note in self.notes.values())
+        count = sum(self.lesson_has_any_content(lesson["id"]) for lesson in self.lessons)
         self.progress.setText(f"已整理 {count} 节\n教材目录共 {len(self.lessons)} 节")
 
     def clear_note(self) -> None:
@@ -3413,6 +4748,9 @@ class MainWindow(QMainWindow):
             self.chapter_notes[chapter_id] = chapter_data
         else:
             self.notes.pop(self.current_id, None)
+            group_id = self.shared_group_id_for(self.current_id)
+            if group_id:
+                self.shared_reference_groups[group_id]["entries"] = []
         self.loading = True
         self.show_current_node()
         self.loading = False
@@ -3426,9 +4764,11 @@ class MainWindow(QMainWindow):
         target, _ = QFileDialog.getSaveFileName(self, "导出教材笔记", str(Path.home() / "Desktop" / f"教材笔记备份_{datetime.now():%Y%m%d}.json"), "JSON 文件 (*.json)")
         if target:
             payload = {
-                "version": 5, "exported_at": now(), "notes": self.notes,
+                "version": 6, "exported_at": now(), "notes": self.notes,
                 "chapter_notes": self.chapter_notes, "section_notes": self.section_notes,
-                "custom_subsections": self.custom_subsections, "screenshots": self.backup_screenshots(),
+                "custom_subsections": self.custom_subsections,
+                "reference_mappings": self.reference_mappings, "shared_reference_groups": self.shared_reference_groups,
+                "screenshots": self.backup_screenshots(),
             }
             Path(target).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             self.status_label.setText(f"已导出到：{target}")
@@ -3453,6 +4793,10 @@ class MainWindow(QMainWindow):
             self.section_notes.update(payload["section_notes"])
         if isinstance(payload.get("custom_subsections"), dict):
             self.custom_subsections.update(payload["custom_subsections"])
+        if isinstance(payload.get("reference_mappings"), dict):
+            self.reference_mappings.update(payload["reference_mappings"])
+        if isinstance(payload.get("shared_reference_groups"), dict):
+            self.shared_reference_groups.update(payload["shared_reference_groups"])
         self.write_notes()
         self.populate_tree()
         self.update_progress()
@@ -3468,6 +4812,7 @@ class MainWindow(QMainWindow):
             "notes": self.notes,
             "chapter_notes": self.chapter_notes,
             "section_notes": self.section_notes,
+            "shared_reference_groups": self.shared_reference_groups,
         }
         for screenshot_id in referenced_screenshot_ids(all_note_data):
             image_path = SCREENSHOT_DIR / f"{screenshot_id}.png"
@@ -3502,6 +4847,7 @@ class MainWindow(QMainWindow):
             return
         self.save_current()
         note = normalize_note(self.notes.get(self.current_id, {}))
+        shared_references = self.shared_reference_entries(self.current_id)
         lesson = self.current_lesson
         parts = [f"# {lesson['section_no']} {lesson['section_title']}", "", "## 教材引言", "", lesson.get("intro_text") or "暂未提取到节引言。", ""]
         if note["intro_note"]:
@@ -3534,6 +4880,11 @@ class MainWindow(QMainWindow):
                         parts.append(f"- 追问：{followup['text']}")
                 parts.append("")
         self.append_title_content_markdown(parts, "易错与辨析", note["pitfalls"])
+        if shared_references:
+            parts.extend(["## 其他版本参考", ""])
+            for entry in shared_references:
+                if entry.get("content"):
+                    parts.extend([entry["content"], ""])
         if note["lesson_note"]:
             parts.extend(["## 课后备注", "", note["lesson_note"], ""])
         target, _ = QFileDialog.getSaveFileName(self, "导出当前小节笔记", str(Path.home() / "Desktop" / f"{lesson['section_no']}_{lesson['section_title']}_教材笔记.md"), "Markdown 文件 (*.md)")
@@ -3549,30 +4900,82 @@ class MainWindow(QMainWindow):
         for entry in entries:
             parts.extend([f"### {entry.get('title') or '未命名项目'}", "", entry.get("content", ""), ""])
 
+    def comparison_all_targets(self, edition: str) -> list[dict]:
+        """取一个版本的真实目录叶节点，供对比窗口候选与手动修正使用。"""
+        targets: list[dict] = []
+        if edition in {"人教A版", "苏教版"}:
+            for lesson in self.lessons:
+                if lesson.get("edition") != edition:
+                    continue
+                reference = lesson.get("pdf_reference", {})
+                path = Path(str(reference.get("path") or PDF_ROOTS.get(edition, Path()) / lesson.get("file", "")))
+                targets.append({
+                    "edition": edition, "book": lesson.get("file", ""),
+                    "title": lesson.get("section_title", ""),
+                    "page": int(reference.get("start") or 1), "level": 1,
+                    "path": str(path), "source": "primary_catalog",
+                })
+        else:
+            for target in self.reference_index.targets(edition):
+                entry = dict(target)
+                entry["path"] = str(PDF_ROOTS.get(edition, Path()) / str(entry.get("book") or ""))
+                targets.append(entry)
+        unique: dict[tuple[str, int, str], dict] = {}
+        for target in targets:
+            key = (str(target.get("book") or ""), int(target.get("page") or 1), str(target.get("title") or ""))
+            unique.setdefault(key, target)
+        return list(unique.values())
+
+    def comparison_targets_for(self, lesson: dict, edition: str) -> tuple[list[dict], dict | None]:
+        """返回置信度排序后的候选；不使用节次号或册次作跨版本映射依据。"""
+        all_targets = self.comparison_all_targets(edition)
+        if edition == lesson.get("edition"):
+            reference = lesson.get("pdf_reference", {})
+            own = {
+                "edition": edition, "book": lesson.get("file", ""), "title": lesson.get("section_title", ""),
+                "page": int(reference.get("start") or 1), "level": 1,
+                "path": str(reference.get("path") or PDF_ROOTS.get(edition, Path()) / lesson.get("file", "")),
+                "source": "current_lesson", "confirmed": True, "score": 999,
+            }
+            return [own], own
+        saved = self.reference_mappings.get(lesson.get("id", ""), {}).get(edition, [])
+        confirmed = [dict(item, score=999, confirmed=True) for item in saved if isinstance(item, dict) and item.get("confirmed")]
+        for target in confirmed:
+            target.setdefault("edition", edition)
+            target.setdefault("path", str(PDF_ROOTS.get(edition, Path()) / str(target.get("book") or "")))
+        scored = []
+        confirmed_keys = {(item.get("book"), item.get("page"), item.get("title")) for item in confirmed}
+        for target in all_targets:
+            score = reference_similarity(str(lesson.get("section_title") or ""), str(target.get("title") or ""))
+            # 对比窗口始终给出“当前最接近”的默认节，但低分会明确标为低置信，
+            # 只供快速起点，绝不写入映射，用户可随时手动修正。
+            if score <= 0:
+                source_key = reference_title_key(str(lesson.get("section_title") or ""))
+                target_key = reference_title_key(str(target.get("title") or ""))
+                score = len(set(source_key) & set(target_key))
+            entry = dict(target, score=score)
+            if (entry.get("book"), entry.get("page"), entry.get("title")) not in confirmed_keys:
+                scored.append(entry)
+        scored.sort(key=lambda item: int(item.get("score", 0)), reverse=True)
+        candidates = confirmed + scored[:24]
+        return candidates, candidates[0] if candidates else None
+
+    def save_comparison_mapping(self, lesson_id: str, edition: str, target: dict) -> None:
+        entry = {key: value for key, value in target.items() if key not in {"path", "score"}}
+        entry["edition"] = edition
+        entry["confirmed"] = True
+        self.reference_mappings.setdefault(lesson_id, {})[edition] = [entry]
+        self.write_notes()
+        self.status_label.setText(f"已确认对比定位：{edition} · {target.get('title', '')}")
+
     def show_comparison(self) -> None:
         if not self.current_lesson or self.current_node_type != "lesson":
             QMessageBox.information(self, "尚未选择小节", "请先选择一个小节，再定位另一版本中的相近内容。")
             return
-        current = self.current_lesson
-        candidates = [entry for entry in self.lessons if entry["edition"] != current["edition"]]
-        tokens = set(current["section_title"])
-        candidates.sort(key=lambda entry: len(tokens & set(entry["section_title"])) + (3 if entry["section_no"] == current["section_no"] else 0), reverse=True)
-        dialog = QDialog(self)
-        dialog.setWindowTitle("跨版本定位")
-        dialog.resize(720, 500)
-        layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel(f"当前：{current['edition']} · {current['section_no']} {current['section_title']}"))
-        output = QTextEdit()
-        output.setReadOnly(True)
-        output.setPlainText("\n\n".join(
-            f"{entry['edition']} · {clean_name(entry['file'])}\n{entry['chapter']}  {entry['section_no']} {entry['section_title']}\n{entry.get('intro_text', '')[:160]}"
-            for entry in candidates[:8]
-        ))
-        layout.addWidget(output)
-        close = QPushButton("关闭")
-        close.clicked.connect(dialog.accept)
-        layout.addWidget(close)
-        dialog.exec()
+        self.comparison_window = ComparisonWindow(self, self.current_lesson, self)
+        self.comparison_window.showMaximized()
+        self.comparison_window.raise_()
+        self.comparison_window.activateWindow()
 
     def show_latex_help(self) -> None:
         QMessageBox.information(self, "LaTeX 输入说明", "所有文本字段都支持 LaTeX。公式用单个美元符号包裹，例如：\n\n$f(x)=x^2+1$\n\n分式：$\\frac{a+b}{2}$\n根式：$\\sqrt{x^2+y^2}$\n\n平时字段只显示排版结果。点击字段后进入源码编辑；光标离开编辑框时会自动收起并重新渲染，“完成编辑”只是可选快捷操作。")
@@ -3584,9 +4987,12 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
+    qInstallMessageHandler(_qt_message_handler)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
     app.setOrganizationName("个人教材笔记本")
+    if APP_ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     app.setStyleSheet("""
         QMainWindow { background: #18232e; color: #dce7ee; }
         #sidebar { background: #1b2732; border-right: 1px solid #324452; }
@@ -3649,6 +5055,21 @@ def main() -> None:
         #captureBar { background: #1e3c59; border: 1px solid #3b719e; border-radius: 7px; color: #d8eaff; }
         #pdfScroll { background: #141e27; border: 1px solid #354a59; border-radius: 7px; }
         #pdfEmpty { color: #9eb3c0; }
+        #comparisonWindow { background: #18232e; color: #dce7ee; }
+        #comparisonWindowTitle { color: #e8f2f8; font-size: 18px; font-weight: 700; padding: 2px 1px; }
+        QCheckBox#comparisonSwitch { color: #cbdce8; font-size: 13px; font-weight: 600; spacing: 6px; }
+        QCheckBox#comparisonSwitch::indicator { width: 30px; height: 17px; border-radius: 9px; background: #314553; border: 1px solid #527082; }
+        QCheckBox#comparisonSwitch::indicator:checked { background: #267bc2; border-color: #63adf0; }
+        #comparisonPaneRow { background: #141e27; }
+        #comparisonPane { background: #1d2a34; border: 1px solid #3b5260; border-radius: 8px; }
+        #comparisonPaneTitle { color: #dcebf5; font-size: 15px; font-weight: 700; }
+        #comparisonTargetBox { background: #253743; border: 1px solid #476171; color: #c9dce8; padding: 5px 7px; }
+        #comparisonZoomControl, #comparisonFit { background: #2a3b47; color: #d7e5ed; border: 1px solid #486170; border-radius: 5px; min-width: 24px; padding: 4px 5px; font-size: 15px; }
+        #comparisonZoomControl:hover, #comparisonFit:hover { background: #345061; border-color: #6aaeff; color: #edf7ff; }
+        #comparisonFit { min-width: 30px; font-size: 12px; font-weight: 650; }
+        #comparisonZoomBox { min-width: 49px; max-width: 58px; background: #253743; border: 1px solid #476171; color: #d8e7f0; padding: 4px 2px; }
+        #comparisonPdfView { background: #141e27; border: 1px solid #354a59; border-radius: 6px; }
+        #comparisonEmpty { color: #9fb4c2; padding: 18px; }
         #sidebarHeaderToggle, #sidebarRailToggle { background: transparent; color: #a9c0ce; border: 0; border-radius: 5px; font-size: 24px; padding: 0 6px; min-width: 28px; }
         #sidebarHeaderToggle:hover, #sidebarRailToggle:hover { background: #2a3b47; color: #ffffff; }
         #editorScroll, #editorScroll::viewport, #editorStack { background: #18232e; border: 0; }
@@ -3660,7 +5081,9 @@ def main() -> None:
     window = MainWindow()
     if not window.lessons:
         QMessageBox.critical(window, "找不到教材资料", f"未能读取教材目录。请确认资料目录存在：\n{window.source_root}")
-    window.show()
+    # 不写死桌面像素尺寸：在笔记本、外接屏和第二台电脑上均铺满可用区域，
+    # 同时仍保留系统标题栏和窗口控制按钮。
+    window.showMaximized()
     sys.exit(app.exec())
 
 
