@@ -5,6 +5,7 @@ import base64
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import shutil
@@ -26,8 +27,8 @@ try:
 except ImportError:  # 旧安装可继续用真正的 PDF 书签；正文定位会提示补装依赖。
     PdfReader = None
 
-from PySide6.QtCore import QEvent, QFileSystemWatcher, QModelIndex, QIODevice, QPointF, QRect, QSaveFile, QSettings, QSize, QTimer, Qt, QUrl, Signal, qInstallMessageHandler
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QImage, QPainter, QPen, QPixmap, QTextCursor
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QModelIndex, QIODevice, QMimeData, QPointF, QRect, QSaveFile, QSettings, QSize, QTimer, Qt, QUrl, Signal, qInstallMessageHandler
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QDrag, QIcon, QImage, QPainter, QPalette, QPen, QPixmap, QTextCursor
 from PySide6.QtPdf import QPdfBookmarkModel, QPdfDocument
 from PySide6.QtPdfWidgets import QPdfView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
@@ -46,6 +47,9 @@ APP_ICON_PATH = ROOT / "assets" / "textbook-notebook-icon.png"
 # 依赖安装在工作区根目录，应用脚本位于“教学设计工作台”子目录。
 KATEX_DIST = ROOT.parent / "node_modules" / "katex" / "dist"
 LEGACY_DATA_PATH = ROOT / "我的教学卡数据.json"
+# 启用坚果云后，编辑过程先持续落到本机草稿；云端 JSON 仅在停顿后批量写入。
+# 该文件不参与同步，意外退出时也可作为待同步内容恢复。
+LOCAL_DRAFT_PATH = ROOT / ".教材笔记本本机草稿.json"
 SOURCE_ROOT_CANDIDATES = (
     ROOT.parent / "节引言资料包",
     ROOT.parent / "中学教材" / "高中" / "数学" / "论文" / "节引言资料包",
@@ -85,6 +89,265 @@ def _qt_message_handler(_mode, _context, message: str) -> None:
     if "qt.pdf.bookmarks: bookmark with invalid location and/or zoom" in message:
         return
     sys.stderr.write(f"{message}\n")
+
+
+def effective_pdf_zoom(view: QPdfView, document: QPdfDocument) -> float:
+    """返回当前页面真正的视觉倍率。
+
+    Qt 在 FitToWidth 模式下把 ``zoomFactor()`` 固定报告为 1.0，实际画面却会
+    随栏宽缩小；直接在 1.0 的基础上加 10% 正是此前一次放大就“飞走”的根源。
+    """
+    if view.zoomMode() != QPdfView.ZoomMode.FitToWidth:
+        return max(0.01, view.zoomFactor())
+    page = max(0, view.pageNavigator().currentPage())
+    size = document.pagePointSize(page)
+    if size.width() <= 0 or view.viewport().width() <= 0:
+        return max(0.01, view.zoomFactor())
+    return max(0.01, view.viewport().width() / size.width())
+
+
+def wheel_zoom_multiplier(event) -> float:
+    """将滚轮/触控板的原始增量换成连续倍率。
+
+    不能把每次事件粗暴地映射成固定的整数百分比：普通鼠标会一格跳太远，
+    触控板又会显得迟钝。指数倍率既能累积细小手势，也让正反缩放互为倒数。
+    """
+    pixel = event.pixelDelta().y()
+    if pixel:
+        # macOS 触控板通常连续给出很小的 pixel delta；约 20px 为 7% 的变化。
+        return math.exp(float(pixel) * 0.0035)
+    angle = event.angleDelta().y()
+    # 标准鼠标一格通常为 120；约为 7.5%，不再出现过去 20% 的跳变。
+    return math.exp(float(angle) * 0.0006) if angle else 1.0
+
+
+def configure_pdf_viewport(view: QPdfView, color: str = "#141e27") -> None:
+    """让 QPdfView 的重绘底图与工作区一致，避免缩放时短暂白闪。"""
+    background = QColor(color)
+    for widget in (view, view.viewport()):
+        palette = widget.palette()
+        palette.setColor(QPalette.ColorRole.Window, background)
+        palette.setColor(QPalette.ColorRole.Base, background)
+        widget.setPalette(palette)
+        widget.setAutoFillBackground(True)
+        widget.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+
+
+def pdf_page_top(document: QPdfDocument, page: int, zoom: float, page_spacing: int) -> float:
+    """返回连续阅读中某页的顶部内容坐标。
+
+    页面高度会随倍率改变，但页与页之间的间距是固定像素，不能把整个滚动条
+    数值直接按倍率相乘；那正是缩放结束后位置发生轻微跳动的原因。
+    """
+    top = float(page_spacing)
+    for index in range(max(0, page)):
+        top += max(1.0, document.pagePointSize(index).height() * zoom) + page_spacing
+    return top
+
+
+def capture_pdf_page_anchor(view: QPdfView, document: QPdfDocument, page_spacing: int, position) -> dict:
+    """把鼠标下的位置记录为“页码 + 页内坐标”，而非粗糙的整本滚动距离。"""
+    zoom = effective_pdf_zoom(view, document)
+    content_y = view.verticalScrollBar().value() + position.y()
+    page_count = document.pageCount()
+    fallback_page = max(0, min(view.pageNavigator().currentPage(), max(0, page_count - 1)))
+    result = {
+        "page": fallback_page,
+        "zoom": zoom,
+        "page_width": document.pagePointSize(fallback_page).width() * zoom if page_count else 0.0,
+        "viewport_width": view.viewport().width(),
+    }
+    for page in range(page_count):
+        top = pdf_page_top(document, page, zoom, page_spacing)
+        height = max(1.0, document.pagePointSize(page).height() * zoom)
+        if top <= content_y <= top + height:
+            result.update({
+                "page": page,
+                "page_y": (content_y - top) / zoom,
+                "page_width": document.pagePointSize(page).width() * zoom,
+            })
+            break
+    return result
+
+
+def restore_pdf_horizontal_anchor(view: QPdfView, document: QPdfDocument, anchor: dict, zoom: float) -> None:
+    """还原横向位置，并在书页跨过视口宽度时保持居中。"""
+    if not document.pageCount():
+        return
+    page = max(0, min(int(anchor.get("page", 0)), document.pageCount() - 1))
+    viewport_width = max(1, view.viewport().width())
+    old_width = float(anchor.get("page_width", 0.0))
+    new_width = document.pagePointSize(page).width() * zoom
+    horizontal = view.horizontalScrollBar()
+    # 书页能完整放下，或正从“完整放下”跨入“需要横向滚动”时，原生阅读器
+    # 的稳定行为都是以页面中心为准；不能沿用灰边上的鼠标横坐标。
+    if new_width <= viewport_width:
+        horizontal.setValue(0)
+    elif old_width <= max(1, int(anchor.get("viewport_width", viewport_width))):
+        # QPdfView 的滚动范围还包含内部页边距，不能用“PDF 宽度减视口宽度”
+        # 猜测中点；直接取它计算完成后的 range 中点才与原生居中完全一致。
+        horizontal.setValue(horizontal.maximum() // 2)
+    else:
+        scale = zoom / max(0.01, float(anchor["zoom"]))
+        horizontal.setValue(round(anchor["content_x"] * scale - anchor["x"]))
+
+
+class PdfZoomPreview(QWidget):
+    """覆盖 QtPdf 的短暂清屏帧；严格区分 Retina 物理像素与 Qt 逻辑坐标。"""
+
+    def __init__(self, view: QPdfView, document: QPdfDocument, page_spacing: int):
+        super().__init__(view.viewport())
+        self.view = view
+        self.document = document
+        self.page_spacing = page_spacing
+        self.source_pixmap = QPixmap()
+        self.preview_scale = 1.0
+        self.source_origin_x = 0
+        self.source_origin_y = 0
+        self.offset_x = 0
+        self.offset_y = 0
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.hide_timer = QTimer(view)
+        self.hide_timer.setSingleShot(True)
+        # PDF 瓦片的重绘比 UI 事件晚，给足一个稳定窗口后才移除临时画面。
+        self.hide_timer.setInterval(320)
+        self.hide_timer.timeout.connect(self.hide_preview)
+        self.hide()
+
+    def build_extended_pdf_source(self, zoom: float) -> bool:
+        """为缩小方向准备包含视口外内容的真实教材画布。"""
+        viewport = self.view.viewport()
+        if not self.document.pageCount() or viewport.width() <= 0 or viewport.height() <= 0:
+            return False
+        ratio = max(1.0, viewport.devicePixelRatioF())
+        padding_x, padding_y = viewport.width(), viewport.height()
+        logical_width = viewport.width() + padding_x * 2
+        logical_height = viewport.height() + padding_y * 2
+        image = QImage(
+            max(1, round(logical_width * ratio)),
+            max(1, round(logical_height * ratio)),
+            QImage.Format.Format_ARGB32_Premultiplied,
+        )
+        image.setDevicePixelRatio(ratio)
+        image.fill(QColor("#bdbdbd"))
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        # QPdfView 在连续阅读的最外层保留一段与 pageSpacing 相同的页边距。
+        # 预览画布也纳入它，才能和原生视图在撤除覆盖层时逐像素对齐。
+        vertical_offset = float(self.page_spacing) - self.view.verticalScrollBar().value()
+        horizontal_offset = -self.view.horizontalScrollBar().value()
+        spacing = float(self.page_spacing)
+        min_y, max_y = -padding_y, viewport.height() + padding_y
+        for page in range(self.document.pageCount()):
+            size = self.document.pagePointSize(page)
+            page_width = max(1.0, size.width() * zoom)
+            page_height = max(1.0, size.height() * zoom)
+            page_y = vertical_offset
+            vertical_offset += page_height + spacing
+            if page_y > max_y:
+                break
+            if page_y + page_height < min_y:
+                continue
+            page_x = max(0.0, (viewport.width() - page_width) / 2.0) + horizontal_offset
+            rendered = self.document.render(
+                page,
+                QSize(max(1, round(page_width * ratio)), max(1, round(page_height * ratio))),
+            )
+            if rendered.isNull():
+                continue
+            pixmap = QPixmap.fromImage(rendered)
+            pixmap.setDevicePixelRatio(ratio)
+            draw_x = round(page_x + padding_x)
+            draw_y = round(page_y + padding_y)
+            # QPdfDocument.render 的页面底色可能是透明的，先补白以还原原生
+            # 阅读器的纸张效果，而非让灰色画布透到正文区域。
+            painter.fillRect(QRect(draw_x, draw_y, round(page_width), round(page_height)), QColor("#ffffff"))
+            painter.drawPixmap(draw_x, draw_y, pixmap)
+        painter.end()
+        self.source_pixmap = QPixmap.fromImage(image)
+        self.source_pixmap.setDevicePixelRatio(ratio)
+        self.source_origin_x = padding_x
+        self.source_origin_y = padding_y
+        return not self.source_pixmap.isNull()
+
+    def show_scaled(self, position, old_zoom: float, new_zoom: float) -> None:
+        if old_zoom <= 0 or new_zoom <= 0:
+            return
+        # 一次持续的缩小手势可能把原始的扩展画布压到不足以盖住视口。此时
+        # 直接以当前倍率重建真实 PDF 画布，再继续缩放，不能把缺口交给深色
+        # 背景去“遮住”。放大方向没有这个问题，旧视口本身已覆盖目标区域。
+        needs_rebase = (
+            not self.source_pixmap.isNull()
+            and self.isVisible()
+            and new_zoom < old_zoom
+            and new_zoom / max(0.01, self.base_zoom) < 0.55
+        )
+        if self.source_pixmap.isNull() or not self.isVisible():
+            # 放大时旧视口已包含目标区域；缩小时需要补出外围教材内容。
+            if new_zoom < old_zoom and not self.build_extended_pdf_source(old_zoom):
+                self.source_pixmap = self.view.viewport().grab()
+                self.source_origin_x = 0
+                self.source_origin_y = 0
+            elif new_zoom >= old_zoom:
+                self.source_pixmap = self.view.viewport().grab()
+                self.source_origin_x = 0
+                self.source_origin_y = 0
+            self.base_zoom = old_zoom
+            self.base_position = position
+        elif needs_rebase:
+            # 此时底层 QPdfView 还停留在 old_zoom。扩展源也必须按这个正在
+            # 显示的真实状态生成，再缩放到 new_zoom；若先按目标倍率渲染，会让
+            # 临时画面与之后的原生页面落在不同位置。
+            if not self.build_extended_pdf_source(old_zoom):
+                self.source_pixmap = self.view.viewport().grab()
+                self.source_origin_x = 0
+                self.source_origin_y = 0
+            self.base_zoom = old_zoom
+            self.base_position = position
+        if self.source_pixmap.isNull():
+            return
+        scale = new_zoom / max(0.01, self.base_zoom)
+        # 不在每个触控板事件中生成一张新的超大位图。尤其 200% 以上时，
+        # ``QPixmap.scaled`` 会反复分配数十 MB，正是起手和过程中发钝的来源。
+        # 交给 paintEvent 的变换绘制，可复用同一张源图且不造成大块内存分配。
+        self.preview_scale = scale
+        # 页面小于阅读栏时，QPdfView 会自动把它水平居中，横向滚动条也不可用。
+        # 此时若仍围绕鼠标横坐标缩放，临时预览会先把页面推到一侧，撤除后再被
+        # 原生视图拉回居中，造成肉眼可见的横向跳动。只有页面确实宽过视口时，
+        # 才保留鼠标横向锚点。
+        page = max(0, min(self.view.pageNavigator().currentPage(), self.document.pageCount() - 1))
+        viewport_width = self.view.viewport().width()
+        base_page_width = self.document.pagePointSize(page).width() * self.base_zoom
+        target_page_width = self.document.pagePointSize(page).width() * new_zoom
+        # 从“完整放下”放大到“需要横向滚动”的临界过程也必须锁在正中；否则
+        # 灰边上的指针会被错误地当成缩放中心，产生大面积空白/底色。
+        anchor_x = viewport_width / 2 if (base_page_width <= viewport_width or target_page_width <= viewport_width) else self.base_position.x()
+        self.offset_x = round(anchor_x - (self.source_origin_x + anchor_x) * scale)
+        self.offset_y = round(self.base_position.y() - (self.source_origin_y + self.base_position.y()) * scale)
+        self.setGeometry(self.view.viewport().rect())
+        self.show()
+        self.raise_()
+        self.update()
+        self.hide_timer.start()
+
+    def paintEvent(self, _event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#141e27"))
+        if not self.source_pixmap.isNull():
+            painter.save()
+            painter.translate(self.offset_x, self.offset_y)
+            painter.scale(self.preview_scale, self.preview_scale)
+            painter.drawPixmap(0, 0, self.source_pixmap)
+            painter.restore()
+
+    def hide_preview(self) -> None:
+        self.hide()
+        self.source_pixmap = QPixmap()
+        self.preview_scale = 1.0
+        # 覆盖层存在时底层视口不会主动补绘；撤除后立即请求一次真实 PDF 重绘。
+        self.view.viewport().update()
+        QTimer.singleShot(0, self.view.viewport().update)
 
 
 def bookmark_key(text: str) -> str:
@@ -577,11 +840,22 @@ class ComparisonPane(QFrame):
         super().__init__(parent)
         self.edition = edition
         self.targets: list[dict] = []
+        self._zoom_anchor: dict | None = None
+        self._zoom_restore_token = 0
+        self._queued_zoom_multiplier = 1.0
+        self._queued_zoom_position = None
+        self._zoom_gesture_timer = QTimer(self)
+        self._zoom_gesture_timer.setSingleShot(True)
+        # 一帧内合并输入；实际倍率保留小数，16ms 约为 60fps。
+        self._zoom_gesture_timer.setInterval(16)
+        self._zoom_gesture_timer.timeout.connect(self.apply_queued_zoom)
         self.setObjectName("comparisonPane")
         self.setMinimumWidth(0)
         self.document = QPdfDocument(self)
         self.view = QPdfView()
         self.view.setObjectName("comparisonPdfView")
+        configure_pdf_viewport(self.view)
+        self._zoom_preview = PdfZoomPreview(self.view, self.document, 8)
         self.view.setDocument(self.document)
         self.view.setPageMode(QPdfView.PageMode.MultiPage)
         self.view.setPageSpacing(8)
@@ -611,12 +885,14 @@ class ComparisonPane(QFrame):
         self.zoom_out = QPushButton("−")
         self.zoom_out.setObjectName("comparisonZoomControl")
         self.zoom_out.setToolTip("缩小（也可按住 Ctrl 后滚轮缩放）")
-        self.zoom_out.clicked.connect(lambda: self.zoom_box.setValue(self.zoom_box.value() - 10))
+        self.zoom_out.clicked.connect(lambda: self._adjust_zoom(-1, self.view.viewport().rect().center()))
         target_row.addWidget(self.zoom_out)
         self.zoom_box = QSpinBox()
         self.zoom_box.setObjectName("comparisonZoomBox")
-        self.zoom_box.setRange(45, 240)
-        self.zoom_box.setSingleStep(10)
+        # 并列七栏时“适宽”的真实倍率可能低于 45%；下限必须足够低，
+        # 否则从适宽切到手动缩放会被强行放大并看起来像跳页。
+        self.zoom_box.setRange(10, 240)
+        self.zoom_box.setSingleStep(1)
         self.zoom_box.setValue(100)
         self.zoom_box.setSuffix("%")
         self.zoom_box.setToolTip("缩放本栏教材")
@@ -625,7 +901,7 @@ class ComparisonPane(QFrame):
         self.zoom_in = QPushButton("+")
         self.zoom_in.setObjectName("comparisonZoomControl")
         self.zoom_in.setToolTip("放大（也可按住 Ctrl 后滚轮缩放）")
-        self.zoom_in.clicked.connect(lambda: self.zoom_box.setValue(self.zoom_box.value() + 10))
+        self.zoom_in.clicked.connect(lambda: self._adjust_zoom(1, self.view.viewport().rect().center()))
         target_row.addWidget(self.zoom_in)
         self.fit_width = QPushButton("适宽")
         self.fit_width.setObjectName("comparisonFit")
@@ -700,22 +976,136 @@ class ComparisonPane(QFrame):
         self.view.pageNavigator().jump(page - 1, QPointF(0, 0), self.view.zoomFactor())
 
     def apply_custom_zoom(self, value: int) -> None:
-        self.view.setZoomMode(QPdfView.ZoomMode.Custom)
-        self.view.setZoomFactor(max(0.45, min(2.4, value / 100.0)))
+        # 输入百分比或点击工具条时，以当前可见区域中心为默认锚点；滚轮会在
+        # _adjust_zoom 中用实际的鼠标位置覆盖它。
+        if self._zoom_anchor is None and self.document.pageCount() and self.stack.currentWidget() is self.view:
+            self.capture_pointer_anchor(self.view.viewport().rect().center())
+        self.apply_zoom_factor(value / 100.0)
+
+    def apply_zoom_factor(self, factor: float, position=None) -> None:
+        """以小数倍率缩放，百分比输入框只用于显示/手输。"""
+        target = max(self.zoom_box.minimum() / 100.0, min(self.zoom_box.maximum() / 100.0, float(factor)))
+        old_zoom = effective_pdf_zoom(self.view, self.document)
+        preview_position = position if position is not None else self.view.viewport().rect().center()
+        if position is not None:
+            self.capture_pointer_anchor(position)
+        elif self._zoom_anchor is None and self.document.pageCount() and self.stack.currentWidget() is self.view:
+            self.capture_pointer_anchor(self.view.viewport().rect().center())
+        percent = max(self.zoom_box.minimum(), min(self.zoom_box.maximum(), round(target * 100)))
+        self.zoom_box.blockSignals(True)
+        self.zoom_box.setValue(percent)
+        self.zoom_box.blockSignals(False)
+        if self.view.zoomMode() != QPdfView.ZoomMode.Custom:
+            self.view.setZoomMode(QPdfView.ZoomMode.Custom)
+        if abs(self.view.zoomFactor() - target) > 0.00005:
+            self._zoom_preview.show_scaled(preview_position, old_zoom, target)
+            self.view.setZoomFactor(target)
+        self.restore_pointer_anchor()
 
     def fit_to_width(self) -> None:
         self.view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+        self.sync_zoom_box_to_view()
 
-    def _adjust_zoom(self, amount: int) -> None:
-        if amount:
-            self.zoom_box.setValue(max(self.zoom_box.minimum(), min(self.zoom_box.maximum(), self.zoom_box.value() + amount)))
+    def sync_zoom_box_to_view(self) -> None:
+        """适宽模式的实际倍率取决于栏宽，不能继续保留旧的 100% 假值。"""
+        def sync() -> None:
+            if self.view.zoomMode() != QPdfView.ZoomMode.FitToWidth:
+                return
+            percent = max(self.zoom_box.minimum(), min(self.zoom_box.maximum(), round(effective_pdf_zoom(self.view, self.document) * 100)))
+            self.zoom_box.blockSignals(True)
+            self.zoom_box.setValue(percent)
+            self.zoom_box.blockSignals(False)
+
+        QTimer.singleShot(0, sync)
+
+    def capture_pointer_anchor(self, position) -> None:
+        """记录鼠标下的内容坐标；缩放后将同一点放回原鼠标位置。"""
+        horizontal = self.view.horizontalScrollBar()
+        vertical = self.view.verticalScrollBar()
+        self._zoom_restore_token += 1
+        page_anchor = capture_pdf_page_anchor(self.view, self.document, 8, position)
+        self._zoom_anchor = {
+            "token": self._zoom_restore_token,
+            "x": position.x(),
+            "y": position.y(),
+            "content_x": horizontal.value() + position.x(),
+            "content_y": vertical.value() + position.y(),
+            **page_anchor,
+        }
+
+    def restore_pointer_anchor(self) -> None:
+        anchor = self._zoom_anchor
+        if not anchor:
+            return
+        token = anchor["token"]
+
+        def apply_anchor() -> None:
+            if not self._zoom_anchor or self._zoom_anchor.get("token") != token:
+                return
+            zoom = effective_pdf_zoom(self.view, self.document)
+            scale = zoom / max(0.01, float(anchor["zoom"]))
+            restore_pdf_horizontal_anchor(self.view, self.document, anchor, zoom)
+            if "page" in anchor and "page_y" in anchor:
+                target_y = pdf_page_top(self.document, int(anchor["page"]), zoom, 8) + float(anchor["page_y"]) * zoom
+                self.view.verticalScrollBar().setValue(round(target_y - anchor["y"]))
+            else:
+                self.view.verticalScrollBar().setValue(round(anchor["content_y"] * scale - anchor["y"]))
+
+        def restore() -> None:
+            if not self._zoom_anchor or self._zoom_anchor.get("token") != token:
+                return
+            apply_anchor()
+
+            # QtPdf 会在下一小段时间内才更新最终的页面布局及滚动范围。立即
+            # 清除锚点会让第二次布局把位置带偏；在布局稳定后再按同一页内坐标
+            # 校正一次，覆盖层仍在，用户不会看到这次内部修正。
+            QTimer.singleShot(96, finish)
+
+        def finish() -> None:
+            if not self._zoom_anchor or self._zoom_anchor.get("token") != token:
+                return
+            apply_anchor()
+            if self._zoom_anchor and self._zoom_anchor.get("token") == token:
+                self._zoom_anchor = None
+
+        # 先在下一轮事件循环给出可见位置，再等布局稳定后精确收尾。
+        QTimer.singleShot(0, restore)
+
+    def _adjust_zoom(self, direction: int, position=None) -> None:
+        if not direction:
+            return
+        # 工具条每次 5% 倍率变化，和常见 PDF 阅读器一致且连续可预期。
+        current = effective_pdf_zoom(self.view, self.document)
+        self.apply_zoom_factor(current * (1.05 if direction > 0 else 1 / 1.05), position)
+
+    def queue_pointer_zoom(self, multiplier: float, position) -> None:
+        """合并一帧内的高频手势，保留真实细粒度倍率。"""
+        if multiplier <= 0:
+            return
+        self._queued_zoom_multiplier = max(0.86, min(1.16, self._queued_zoom_multiplier * multiplier))
+        self._queued_zoom_position = position
+        # 不能在每个触控板事件上重启定时器，否则连续手势会一直等到松手才缩放。
+        if not self._zoom_gesture_timer.isActive():
+            self._zoom_gesture_timer.start()
+
+    def apply_queued_zoom(self) -> None:
+        multiplier, position = self._queued_zoom_multiplier, self._queued_zoom_position
+        self._queued_zoom_multiplier = 1.0
+        self._queued_zoom_position = None
+        if abs(multiplier - 1.0) > 0.0005:
+            self.apply_zoom_factor(effective_pdf_zoom(self.view, self.document) * multiplier, position)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if self.view.zoomMode() == QPdfView.ZoomMode.FitToWidth:
+            self.sync_zoom_box_to_view()
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
         if watched is self.view.viewport():
             if event.type() == QEvent.Type.Wheel and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                delta = event.angleDelta().y() or event.pixelDelta().y()
-                if delta:
-                    self._adjust_zoom(10 if delta > 0 else -10)
+                multiplier = wheel_zoom_multiplier(event)
+                if abs(multiplier - 1.0) > 0.00001:
+                    self.queue_pointer_zoom(multiplier, event.position().toPoint())
                     event.accept()
                     return True
             if event.type() == QEvent.Type.NativeGesture and hasattr(event, "gestureType"):
@@ -723,7 +1113,8 @@ class ComparisonPane(QFrame):
                 if native_type is not None and event.gestureType() == native_type:
                     amount = float(event.value())
                     if amount:
-                        self._adjust_zoom(max(4, round(abs(amount) * 100)) * (1 if amount > 0 else -1))
+                        position = event.position().toPoint() if hasattr(event, "position") else self.view.viewport().rect().center()
+                        self.queue_pointer_zoom(math.exp(amount * 2.5), position)
                         event.accept()
                         return True
         return super().eventFilter(watched, event)
@@ -1119,11 +1510,23 @@ class PdfReaderPanel(QFrame):
         self._continuous_labels: dict[int, QLabel] = {}
         self._continuous_updating = False
         self._pending_continuous_direction = 0
+        self._native_zoom_anchor: dict | None = None
+        self._scroll_zoom_anchor: dict | None = None
+        self._native_custom_zoom_factor = 0.85
+        self._zoom_restore_token = 0
         # 连续缩放时不要为每一个滚轮刻度同步重绘 PDF；等手势停顿后只画一次。
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(90)
         self._render_timer.timeout.connect(self.refresh_reader_view)
+        self._queued_zoom_multiplier = 1.0
+        self._queued_zoom_watched = None
+        self._queued_zoom_position = None
+        self._zoom_gesture_timer = QTimer(self)
+        self._zoom_gesture_timer.setSingleShot(True)
+        # 以约 60fps 合并高频输入；每帧保留连续小数倍率。
+        self._zoom_gesture_timer.setInterval(16)
+        self._zoom_gesture_timer.timeout.connect(self.apply_queued_zoom)
         # 将“接下一页”移出滚动信号调用栈，避免滚动条变化触发递归渲染。
         self._continuous_extend_timer = QTimer(self)
         self._continuous_extend_timer.setSingleShot(True)
@@ -1180,12 +1583,12 @@ class PdfReaderPanel(QFrame):
         self.zoom_out = QPushButton("−")
         self.zoom_out.setObjectName("pdfControl")
         self.zoom_out.setToolTip("缩小")
-        self.zoom_out.clicked.connect(lambda: self.zoom_box.setValue(self.zoom_box.value() - 10))
+        self.zoom_out.clicked.connect(lambda: self.zoom_from_control(-1))
         zoom_controls.addWidget(self.zoom_out)
         self.zoom_box = QSpinBox()
         self.zoom_box.setObjectName("pdfZoomBox")
-        self.zoom_box.setRange(20, 260)
-        self.zoom_box.setSingleStep(10)
+        self.zoom_box.setRange(10, 260)
+        self.zoom_box.setSingleStep(1)
         self.zoom_box.setValue(85)
         self.zoom_box.setSuffix("%")
         self.zoom_box.valueChanged.connect(self.on_zoom_changed)
@@ -1193,7 +1596,7 @@ class PdfReaderPanel(QFrame):
         self.zoom_in = QPushButton("+")
         self.zoom_in.setObjectName("pdfControl")
         self.zoom_in.setToolTip("放大")
-        self.zoom_in.clicked.connect(lambda: self.zoom_box.setValue(self.zoom_box.value() + 10))
+        self.zoom_in.clicked.connect(lambda: self.zoom_from_control(1))
         zoom_controls.addWidget(self.zoom_in)
         self.fit_width = QPushButton("适合宽度")
         self.fit_width.setObjectName("smallAction")
@@ -1241,6 +1644,8 @@ class PdfReaderPanel(QFrame):
         # 不能再把多张 QImage 手工堆进滚动容器。
         self.native_view = QPdfView()
         self.native_view.setObjectName("nativePdfView")
+        configure_pdf_viewport(self.native_view)
+        self._native_zoom_preview = PdfZoomPreview(self.native_view, self.document, 10)
         self.native_view.setDocument(self.document)
         self.native_view.setPageMode(QPdfView.PageMode.MultiPage)
         self.native_view.setPageSpacing(10)
@@ -1386,7 +1791,26 @@ class PdfReaderPanel(QFrame):
         self.render_page(navigate=True)
 
     def on_zoom_changed(self, _value: int) -> None:
+        # 按工具条手改百分比时没有鼠标落点，按阅读区域中心稳定缩放；滚轮/捏合
+        # 已提前记录真实鼠标位置，因此不会走到这里的中心锚点。
+        if not self._native_zoom_anchor and not self._scroll_zoom_anchor:
+            if self.reader_stack.currentWidget() is self.native_view:
+                self.capture_pdf_pointer_anchor(self.native_view.viewport().rect().center())
+            elif self.reader_stack.currentWidget() is self.scroll:
+                self.capture_scroll_pointer_anchor(self.scroll.viewport().rect().center())
         self.fit_width_enabled = False
+        self._native_custom_zoom_factor = _value / 100.0
+        # 普通阅读已在 QPdfView 中显示时无需重新切换页面栈或等待渲染定时器；
+        # 直接更新原生视图能消除缩放时的白闪。
+        if self.reader_stack.currentWidget() is self.native_view and not self.capture_mode and not self.highlight_rect:
+            self._render_timer.stop()
+            old_zoom = effective_pdf_zoom(self.native_view, self.document)
+            target = _value / 100.0
+            if abs(old_zoom - target) > 0.00005:
+                self._native_zoom_preview.show_scaled(self.native_view.viewport().rect().center(), old_zoom, target)
+            self.apply_native_view_settings()
+            self.restore_native_pointer_anchor()
+            return
         self.schedule_render()
 
     def set_continuous_mode(self, enabled: bool) -> None:
@@ -1402,6 +1826,10 @@ class PdfReaderPanel(QFrame):
         if point_size.width() <= 0:
             return
         self.fit_width_enabled = True
+        if self.reader_stack.currentWidget() is self.native_view and not self.capture_mode and not self.highlight_rect:
+            self._render_timer.stop()
+            self.apply_native_view_settings()
+            return
         self.schedule_render()
 
     def schedule_render(self) -> None:
@@ -1422,14 +1850,32 @@ class PdfReaderPanel(QFrame):
         self.render_page(navigate=False)
 
     def apply_native_view_settings(self) -> None:
-        self.native_view.setPageMode(
-            QPdfView.PageMode.MultiPage if self.continuous_mode else QPdfView.PageMode.SinglePage
-        )
+        page_mode = QPdfView.PageMode.MultiPage if self.continuous_mode else QPdfView.PageMode.SinglePage
+        if self.native_view.pageMode() != page_mode:
+            self.native_view.setPageMode(page_mode)
         if self.fit_width_enabled:
-            self.native_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+            if self.native_view.zoomMode() != QPdfView.ZoomMode.FitToWidth:
+                self.native_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+            self.sync_zoom_box_to_native_view()
         else:
-            self.native_view.setZoomMode(QPdfView.ZoomMode.Custom)
-            self.native_view.setZoomFactor(self.zoom_box.value() / 100.0)
+            if self.native_view.zoomMode() != QPdfView.ZoomMode.Custom:
+                self.native_view.setZoomMode(QPdfView.ZoomMode.Custom)
+            target = self._native_custom_zoom_factor
+            if abs(self.native_view.zoomFactor() - target) > 0.00005:
+                self.native_view.setZoomFactor(target)
+
+    def sync_zoom_box_to_native_view(self) -> None:
+        """适合宽度后的真实倍率随阅读栏宽度变化，必须同步回缩放控件。"""
+        def sync() -> None:
+            if not self.fit_width_enabled or self.native_view.zoomMode() != QPdfView.ZoomMode.FitToWidth:
+                return
+            percent = max(self.zoom_box.minimum(), min(self.zoom_box.maximum(), round(effective_pdf_zoom(self.native_view, self.document) * 100)))
+            self.zoom_box.blockSignals(True)
+            self.zoom_box.setValue(percent)
+            self.zoom_box.blockSignals(False)
+            self._native_custom_zoom_factor = percent / 100.0
+
+        QTimer.singleShot(0, sync)
 
     def show_native_page(self, navigate: bool) -> None:
         self.apply_native_view_settings()
@@ -1437,6 +1883,8 @@ class PdfReaderPanel(QFrame):
         if navigate:
             # 原生视图负责整本连续滚动与定位，不再同步渲染/堆叠位图。
             self.native_view.pageNavigator().jump(self.current_page - 1, QPointF(0, 0), self.native_view.zoomFactor())
+        else:
+            self.restore_native_pointer_anchor()
 
     def page_render_size(self, page: int) -> tuple[int, int, float]:
         point_size = self.document.pagePointSize(page - 1)
@@ -1563,18 +2011,154 @@ class PdfReaderPanel(QFrame):
         self.crop_label.set_highlight_normalized(self.highlight_rect)
         self.scroll.setWidget(self.crop_label)
         self.reader_stack.setCurrentWidget(self.scroll)
+        self.restore_scroll_pointer_anchor()
 
-    def _adjust_zoom(self, amount: int) -> None:
-        if not amount:
+    def capture_pdf_pointer_anchor(self, position) -> None:
+        horizontal = self.native_view.horizontalScrollBar()
+        vertical = self.native_view.verticalScrollBar()
+        self._zoom_restore_token += 1
+        page_anchor = capture_pdf_page_anchor(self.native_view, self.document, 10, position)
+        self._native_zoom_anchor = {
+            "token": self._zoom_restore_token,
+            "x": position.x(),
+            "y": position.y(),
+            "content_x": horizontal.value() + position.x(),
+            "content_y": vertical.value() + position.y(),
+            **page_anchor,
+        }
+
+    def capture_scroll_pointer_anchor(self, position) -> None:
+        horizontal = self.scroll.horizontalScrollBar()
+        vertical = self.scroll.verticalScrollBar()
+        self._zoom_restore_token += 1
+        self._scroll_zoom_anchor = {
+            "token": self._zoom_restore_token,
+            "x": position.x(),
+            "y": position.y(),
+            "content_x": horizontal.value() + position.x(),
+            "content_y": vertical.value() + position.y(),
+            "zoom": max(0.01, self.zoom_box.value() / 100.0),
+        }
+
+    def restore_native_pointer_anchor(self) -> None:
+        anchor = self._native_zoom_anchor
+        if not anchor:
             return
-        self.zoom_box.setValue(max(self.zoom_box.minimum(), min(self.zoom_box.maximum(), self.zoom_box.value() + amount)))
+        token = anchor["token"]
+
+        def apply_anchor() -> None:
+            if not self._native_zoom_anchor or self._native_zoom_anchor.get("token") != token:
+                return
+            zoom = effective_pdf_zoom(self.native_view, self.document)
+            scale = zoom / max(0.01, float(anchor["zoom"]))
+            restore_pdf_horizontal_anchor(self.native_view, self.document, anchor, zoom)
+            if "page" in anchor and "page_y" in anchor:
+                target_y = pdf_page_top(self.document, int(anchor["page"]), zoom, 10) + float(anchor["page_y"]) * zoom
+                self.native_view.verticalScrollBar().setValue(round(target_y - anchor["y"]))
+            else:
+                self.native_view.verticalScrollBar().setValue(round(anchor["content_y"] * scale - anchor["y"]))
+
+        def restore() -> None:
+            if not self._native_zoom_anchor or self._native_zoom_anchor.get("token") != token:
+                return
+            apply_anchor()
+            QTimer.singleShot(96, finish)
+
+        def finish() -> None:
+            if not self._native_zoom_anchor or self._native_zoom_anchor.get("token") != token:
+                return
+            apply_anchor()
+            if self._native_zoom_anchor and self._native_zoom_anchor.get("token") == token:
+                self._native_zoom_anchor = None
+
+        QTimer.singleShot(0, restore)
+
+    def restore_scroll_pointer_anchor(self) -> None:
+        anchor = self._scroll_zoom_anchor
+        if not anchor:
+            return
+        token = anchor["token"]
+
+        def restore() -> None:
+            if not self._scroll_zoom_anchor or self._scroll_zoom_anchor.get("token") != token:
+                return
+            scale = (self.zoom_box.value() / 100.0) / max(0.01, float(anchor["zoom"]))
+            self.scroll.horizontalScrollBar().setValue(round(anchor["content_x"] * scale - anchor["x"]))
+            self.scroll.verticalScrollBar().setValue(round(anchor["content_y"] * scale - anchor["y"]))
+            if self._scroll_zoom_anchor and self._scroll_zoom_anchor.get("token") == token:
+                self._scroll_zoom_anchor = None
+
+        QTimer.singleShot(0, restore)
+
+    def zoom_from_control(self, amount: int) -> None:
+        watched = self.native_view.viewport() if self.reader_stack.currentWidget() is self.native_view else self.scroll.viewport()
+        self._adjust_zoom(amount, watched, watched.rect().center())
+
+    def apply_zoom_factor(self, factor: float, watched=None, position=None) -> None:
+        """以连续小数倍率更新阅读器；百分比框不参与缩放步长。"""
+        target = max(self.zoom_box.minimum() / 100.0, min(self.zoom_box.maximum() / 100.0, float(factor)))
+        native_zoom = effective_pdf_zoom(self.native_view, self.document)
+        if watched is self.native_view.viewport() and position is not None:
+            self.capture_pdf_pointer_anchor(position)
+        elif watched is self.scroll.viewport() and position is not None:
+            self.capture_scroll_pointer_anchor(position)
+        elif not self._native_zoom_anchor and not self._scroll_zoom_anchor:
+            if self.reader_stack.currentWidget() is self.native_view:
+                self.capture_pdf_pointer_anchor(self.native_view.viewport().rect().center())
+            elif self.reader_stack.currentWidget() is self.scroll:
+                self.capture_scroll_pointer_anchor(self.scroll.viewport().rect().center())
+        self.fit_width_enabled = False
+        self._native_custom_zoom_factor = target
+        self.zoom_box.blockSignals(True)
+        self.zoom_box.setValue(round(target * 100))
+        self.zoom_box.blockSignals(False)
+        if watched is self.native_view.viewport() or self.reader_stack.currentWidget() is self.native_view:
+            self._render_timer.stop()
+            preview_position = position if position is not None else self.native_view.viewport().rect().center()
+            if abs(native_zoom - target) > 0.00005:
+                self._native_zoom_preview.show_scaled(preview_position, native_zoom, target)
+            self.apply_native_view_settings()
+            self.restore_native_pointer_anchor()
+        else:
+            self.schedule_render()
+
+    def _adjust_zoom(self, direction: int, watched=None, position=None) -> None:
+        if not direction:
+            return
+        if watched is self.native_view.viewport():
+            current = effective_pdf_zoom(self.native_view, self.document)
+        else:
+            current = self.zoom_box.value() / 100.0
+        self.apply_zoom_factor(current * (1.05 if direction > 0 else 1 / 1.05), watched, position)
+
+    def queue_pointer_zoom(self, multiplier: float, watched, position) -> None:
+        """将高频滚轮/捏合手势合为一帧，既跟手也不频繁重绘。"""
+        if multiplier <= 0:
+            return
+        self._queued_zoom_multiplier = max(0.86, min(1.16, self._queued_zoom_multiplier * multiplier))
+        self._queued_zoom_watched = watched
+        self._queued_zoom_position = position
+        # 维持固定帧率消化输入，不把触控板的连续手势攒成松手后的大跳变。
+        if not self._zoom_gesture_timer.isActive():
+            self._zoom_gesture_timer.start()
+
+    def apply_queued_zoom(self) -> None:
+        multiplier = self._queued_zoom_multiplier
+        watched, position = self._queued_zoom_watched, self._queued_zoom_position
+        self._queued_zoom_multiplier = 1.0
+        self._queued_zoom_watched = None
+        self._queued_zoom_position = None
+        if abs(multiplier - 1.0) <= 0.0005:
+            return
+        current = effective_pdf_zoom(self.native_view, self.document) if watched is self.native_view.viewport() else self.zoom_box.value() / 100.0
+        self.apply_zoom_factor(current * multiplier, watched, position)
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
         if watched in {self.scroll.viewport(), self.native_view.viewport()}:
             if event.type() == QEvent.Type.Wheel and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                delta = event.angleDelta().y() or event.pixelDelta().y()
-                if delta:
-                    self._adjust_zoom(10 if delta > 0 else -10)
+                multiplier = wheel_zoom_multiplier(event)
+                if abs(multiplier - 1.0) > 0.00001:
+                    self.queue_pointer_zoom(multiplier, watched, event.position().toPoint())
                     event.accept()
                     return True
             if event.type() == QEvent.Type.NativeGesture and hasattr(event, "gestureType"):
@@ -1582,7 +2166,8 @@ class PdfReaderPanel(QFrame):
                 if native_type is not None and event.gestureType() == native_type:
                     value = float(event.value())
                     if value:
-                        self._adjust_zoom(max(4, round(abs(value) * 100)) * (1 if value > 0 else -1))
+                        position = event.position().toPoint() if hasattr(event, "position") else watched.rect().center()
+                        self.queue_pointer_zoom(math.exp(value * 2.5), watched, position)
                         event.accept()
                         return True
         return super().eventFilter(watched, event)
@@ -1590,7 +2175,10 @@ class PdfReaderPanel(QFrame):
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         if self.fit_width_enabled and self.document.pageCount() and not self.capture_mode:
-            self.schedule_render()
+            if self.reader_stack.currentWidget() is self.native_view:
+                self.apply_native_view_settings()
+            else:
+                self.schedule_render()
 
     def begin_capture(self) -> bool:
         if not self.document.pageCount():
@@ -1677,7 +2265,7 @@ def source_intro_crop_rect(page_image_path: str, intro_image_path: str) -> tuple
 class NotebookStorage:
     """本机设置 + 可被坚果云同步的笔记资料目录。"""
     FOLDER_NAME = "教材笔记本数据"
-    LOCK_TTL_SECONDS = 150
+    LOCK_TTL_SECONDS = 12 * 60
 
     def __init__(self):
         self.settings = QSettings("Chuan", "高中数学教材笔记本")
@@ -1893,7 +2481,7 @@ def normalize_note(note: dict) -> dict:
             for item in items.get("knowledge", [])
         ]
         result["patterns"] = [
-            {"title": str(item.get("title", "")), "example": "", "note": str(item.get("content", ""))}
+            {"title": str(item.get("title", "")), "content": str(item.get("content", ""))}
             for item in items.get("basic_patterns", [])
         ]
         result["examples"] = [
@@ -1924,7 +2512,7 @@ def normalize_legacy_teaching_card(note: dict) -> dict:
     if note.get("goal"):
         result["knowledge"].append({"title": "目标与重点", "content": str(note["goal"])})
     if note.get("examples"):
-        result["patterns"].append({"title": "例题与习题组", "example": "", "note": str(note["examples"])})
+        result["patterns"].append({"title": "例题与习题组", "content": str(note["examples"])})
     if note.get("questions"):
         result["questions"].append({"question": str(note["questions"]), "followups": []})
     if note.get("micro_teaching"):
@@ -1975,12 +2563,18 @@ window.addEventListener('load', () => {
 </script>"""
 
 
-def render_text_fragment(text: str) -> str:
+def render_text_fragment(text: str, soft_wrap: bool = False) -> str:
     """转义普通文本，同时把持久化的教材截图标记替换为本地图片。"""
     parts = []
     cursor = 0
     for match in SCREENSHOT_TOKEN.finditer(text):
-        parts.append(html.escape(text[cursor:match.start()]))
+        plain = text[cursor:match.start()]
+        # 紧凑卡片给普通正文插入零宽断行点：连续中文、编号串或 @@@@ 之类
+        # 没有空格的内容也能在实际列宽内折行。公式节点仍完整交给 KaTeX。
+        if soft_wrap:
+            parts.append("".join("<br>" if char == "\n" else f"{html.escape(char)}<wbr>" for char in plain))
+        else:
+            parts.append(html.escape(plain))
         image_path = SCREENSHOT_DIR / f"{match.group(1)}.png"
         if image_path.exists():
             # QWebEngine 对 file:// 的跨目录读取会受平台策略影响；嵌入数据可稳定显示并便于预览缓存。
@@ -1989,11 +2583,15 @@ def render_text_fragment(text: str) -> str:
         else:
             parts.append("<span class='missing-shot'>[教材截图文件缺失]</span>")
         cursor = match.end()
-    parts.append(html.escape(text[cursor:]))
+    plain = text[cursor:]
+    if soft_wrap:
+        parts.append("".join("<br>" if char == "\n" else f"{html.escape(char)}<wbr>" for char in plain))
+    else:
+        parts.append(html.escape(plain))
     return "".join(parts)
 
 
-def render_mixed_math_html(text: str, placeholder: str) -> str:
+def render_mixed_math_html(text: str, placeholder: str, soft_wrap: bool = True) -> str:
     """与题目管理器一致地将正文分成自然段，再嵌入行内公式。"""
     if not text.strip():
         # 空字段保持真正的留白。字段用途由栏目标题、卡片结构和按钮表达，
@@ -2002,32 +2600,35 @@ def render_mixed_math_html(text: str, placeholder: str) -> str:
     parts = []
     cursor = 0
     for match in FORMULA_PATTERN.finditer(text):
-        parts.append(render_text_fragment(text[cursor:match.start()]))
+        parts.append(render_text_fragment(text[cursor:match.start()], soft_wrap))
         parts.append(render_formula_html(match.group(0)))
         cursor = match.end()
-    parts.append(render_text_fragment(text[cursor:]))
+    parts.append(render_text_fragment(text[cursor:], soft_wrap))
     body = "".join(parts)
     return "".join(f"<p>{paragraph.replace(chr(10), '<br>')}</p>" for paragraph in body.split("\n\n"))
 
 
-def render_math_field_document(text: str, placeholder: str, compact: bool = False) -> str:
+def render_math_field_document(text: str, placeholder: str, compact: bool = False, allow_wrap: bool = False) -> str:
     """与题目管理器一致地交给 Chromium 渲染 HTML + SVG。"""
     typography = (
         "body { padding: 5px 8px; font-size: 16px; line-height: 1.45; } "
         "p { margin: 0; line-height: 1.45; white-space: nowrap; overflow: hidden; }"
+        if compact and not allow_wrap else
+        "body { padding: 5px 8px; font-size: 16px; line-height: 1.5; min-width: 0; } "
+        "p { display: block; width: 100% !important; max-width: 100% !important; margin: 0; line-height: 1.5; font-size: 16px; white-space: normal; overflow-wrap: anywhere; word-break: break-all; }"
         if compact else
         "body { padding: 7px 10px; font-size: 17px; line-height: 1.82; } "
         "p { margin: 8px 0; line-height: 1.82; font-size: 17px; word-break: break-word; }"
     )
     return f"""<!doctype html>
-<html lang='zh-CN'><head><meta charset='utf-8'><style>
+<html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'><style>
 * {{ box-sizing: border-box; }}
-html, body {{ margin: 0; overflow: hidden; background: transparent; }}
-body {{ color: #e4eef3; font-family: \"Times New Roman\", \"Songti SC\", \"STSong\", serif; cursor: text; }}
+html {{ margin: 0; width: 100%; overflow: hidden; background: transparent; }}
+body {{ margin: 0; width: 100%; overflow: visible; background: transparent; color: #e4eef3; font-family: \"Times New Roman\", \"Songti SC\", \"STSong\", serif; cursor: text; }}
 {typography}
 .latex-source {{ white-space: nowrap; margin: 0 .18em; }}
 .katex {{ font-size: 1em; }}
-#content {{ display: flow-root; padding-bottom: 4px; }}
+#content, #content p {{ display: flow-root; width: 100% !important; max-width: 100% !important; min-width: 0 !important; padding-bottom: 4px; overflow-wrap: anywhere !important; word-break: break-all !important; line-break: anywhere; }}
 .textbook-shot {{ display: block; max-width: min(100%, 760px); max-height: 460px; object-fit: contain; margin: 10px 0; border: 1px solid #d6cdbb; border-radius: 6px; }}
 .missing-shot {{ color: #ff9a9f; font-family: \"PingFang SC\", sans-serif; }}
 .math-fallback {{ color: #ff9a9f; font-family: \"Menlo\", monospace; font-size: .9em; }}
@@ -2037,22 +2638,39 @@ body {{ color: #e4eef3; font-family: \"Times New Roman\", \"Songti SC\", \"STSon
 
 def render_list_detail_document(key: str, entries: list[dict]) -> str:
     title = SECTION_META[key][0]
+
+    def indexed_line(index: int, text: str, fallback: str) -> str:
+        return (
+            f"<div class='compact-list-line'><span class='list-index'>{index}.</span>"
+            f"<div class='list-title'>{render_mixed_math_html(text, fallback)}</div></div>"
+        )
+
+    def named_line(label: str, text: str) -> str:
+        if not text.strip():
+            return ""
+        return (
+            f"<div class='field-line'><span>{label}</span>"
+            f"<div>{render_mixed_math_html(text, '')}</div></div>"
+        )
+
     cards = []
     for index, entry in enumerate(entries, 1):
         if key == "knowledge":
-            body = f"<h3>{index}. {render_mixed_math_html(entry.get('title', ''), '未命名知识点')}</h3><div>{render_mixed_math_html(entry.get('content', ''), '暂无内容')}</div>"
+            body = indexed_line(index, entry.get("title", ""), "未命名知识点") + named_line("内容", entry.get("content", ""))
         elif key == "patterns":
-            body = (
-                f"<h3>{index}. {render_mixed_math_html(entry.get('title', ''), '未命名题型')}</h3>"
-                f"<h4>示例</h4><div>{render_mixed_math_html(entry.get('example', ''), '暂无示例')}</div>"
-                f"<h4>备注</h4><div>{render_mixed_math_html(entry.get('note', ''), '暂无备注')}</div>"
+            # 新版题型仅有标题与一段可选内容；同时兼容旧的“示例 / 备注”。
+            legacy_content = "\n".join(
+                part for part in (entry.get("example", ""), entry.get("note", "")) if str(part).strip()
+            )
+            body = indexed_line(index, entry.get("title", ""), "未命名题型") + named_line(
+                "内容", entry.get("content", "") or legacy_content
             )
         elif key == "examples":
             body = (
-                f"<h3>{index}. {render_mixed_math_html(entry.get('title', ''), '未命名例题')}</h3>"
-                f"<h4>来源</h4><div>{render_mixed_math_html(entry.get('source', ''), '未标注')}</div>"
-                f"<h4>原题</h4><div>{render_mixed_math_html(entry.get('problem', ''), '暂无原题')}</div>"
-                f"<h4>备注</h4><div>{render_mixed_math_html(entry.get('note', ''), '暂无备注')}</div>"
+                indexed_line(index, entry.get("title", ""), "未命名例题")
+                + named_line("来源", entry.get("source", ""))
+                + named_line("原题", entry.get("problem", ""))
+                + named_line("备注", entry.get("note", ""))
             )
         elif key == "questions":
             followups = "".join(
@@ -2061,14 +2679,14 @@ def render_list_detail_document(key: str, entries: list[dict]) -> str:
             )
             body = f"<div class='question-line'><strong>【问题{index}】</strong>{render_mixed_math_html(entry.get('question', ''), '')}</div>{followups}"
         elif key == "other_references":
-            body = f"<div>{render_mixed_math_html(entry.get('content', ''), '暂无内容')}</div>"
+            body = indexed_line(index, entry.get("content", ""), "暂无内容")
         else:
-            body = f"<h3>{index}. {render_mixed_math_html(entry.get('title', ''), '未命名项目')}</h3><div>{render_mixed_math_html(entry.get('content', ''), '暂无内容')}</div>"
-        cards.append(f"<article>{body}</article>")
+            body = indexed_line(index, entry.get("title", ""), "未命名项目") + named_line("内容", entry.get("content", ""))
+        cards.append(f"<article class='compact-item'>{body}</article>")
     content = "".join(cards) or "<p class='empty'>暂未添加项目。</p>"
     return f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><style>
-* {{ box-sizing:border-box; }} body {{ margin:0; padding:22px 24px 36px; background:#18232e; color:#e4eef3; font-family:\"Times New Roman\",\"Songti SC\",\"STSong\",serif; font-size:16px; line-height:1.75; }}
-article {{ background:#23313d; border:1px solid #3b5260; border-left:4px solid #4b9fff; border-radius:8px; padding:13px 16px; margin:0 0 12px; }} h3 {{ margin:0 0 8px; color:#a4ceff; font-size:18px; }} h4 {{ margin:11px 0 2px; color:#9db8d8; font-family:\"PingFang SC\",sans-serif; font-size:13px; }} p {{ margin:8px 0; line-height:1.82; font-size:17px; word-break:break-word; }} .question-line {{ display:flex; gap:10px; align-items:baseline; }} .question-line strong, .question-followup span {{ color:#a8c8dd; font-family:\"PingFang SC\",sans-serif; font-size:13px; white-space:nowrap; }} .question-line p, .question-followup p {{ margin:0; }} .question-followup {{ display:flex; gap:10px; align-items:baseline; margin:7px 0 0 22px; }} .latex-source {{ white-space:nowrap; margin:0 .18em; }} .katex {{ font-size:1em; }} .textbook-shot {{ display:block; max-width:min(100%,760px); max-height:460px; object-fit:contain; margin:10px 0; border:1px solid #587287; border-radius:6px; }} .missing-shot {{ color:#ff9a9f; }} .math-fallback {{ color:#ff9a9f; font-family:Menlo,monospace; }} .empty {{ color:#9bb0be; font-style:italic; }}
+* {{ box-sizing:border-box; }} body {{ margin:0; padding:20px 24px 32px; background:#18232e; color:#e4eef3; font-family:\"Times New Roman\",\"Songti SC\",\"STSong\",serif; font-size:16px; line-height:1.75; }} h2 {{ margin:0 0 15px; color:#e6f1fa; font-size:23px; line-height:1.25; }}
+article {{ background:#23313d; border:1px solid #3b5260; border-left:4px solid #4b9fff; border-radius:8px; padding:10px 14px; margin:0 0 8px; }} article.compact-item {{ padding:10px 14px; }} h3 {{ margin:0 0 8px; color:#a4ceff; font-size:18px; }} h4 {{ margin:11px 0 2px; color:#9db8d8; font-family:\"PingFang SC\",sans-serif; font-size:13px; }} p {{ margin:0; line-height:1.55; font-size:16px; overflow-wrap:anywhere; word-break:break-all; }} .compact-list-line {{ display:grid; grid-template-columns:auto minmax(0,1fr); align-items:start; column-gap:10px; min-width:0; }} .list-index {{ color:#9bcaff; font-family:\"PingFang SC\",sans-serif; font-size:16px; font-weight:700; white-space:nowrap; }} .list-title {{ min-width:0; color:#cfe4f8; font-size:17px; font-weight:650; overflow-wrap:anywhere; word-break:break-all; }} .compact-list-line p {{ margin:0; line-height:1.45; }} .field-line {{ display:grid; grid-template-columns:auto minmax(0,1fr); align-items:start; column-gap:9px; margin:4px 0 0 27px; color:#d7e4ec; min-width:0; }} .field-line > span {{ color:#9db8d8; font-family:\"PingFang SC\",sans-serif; font-size:12px; font-weight:650; white-space:nowrap; }} .field-line > div {{ min-width:0; overflow-wrap:anywhere; word-break:break-all; }} .field-line p {{ margin:0; line-height:1.55; }} .question-line, .question-followup {{ display:grid; grid-template-columns:auto minmax(0,1fr); align-items:start; column-gap:10px; min-width:0; }} .question-line strong, .question-followup span {{ color:#a8c8dd; font-family:\"PingFang SC\",sans-serif; font-size:13px; white-space:nowrap; }} .question-line p, .question-followup p {{ margin:0; overflow-wrap:anywhere; word-break:break-all; }} .question-followup {{ margin:7px 0 0 22px; }} .latex-source {{ white-space:nowrap; margin:0 .18em; }} .katex {{ font-size:1em; }} .textbook-shot {{ display:block; max-width:min(100%,760px); max-height:460px; object-fit:contain; margin:10px 0; border:1px solid #587287; border-radius:6px; }} .missing-shot {{ color:#ff9a9f; }} .math-fallback {{ color:#ff9a9f; font-family:Menlo,monospace; }} .empty {{ color:#9bb0be; font-style:italic; }}
 </style>{katex_runtime()}</head><body><h2>{title}</h2>{content}</body></html>"""
 
 
@@ -2096,25 +2714,90 @@ class ClickableMathView(QWebEngineView):
         self.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
         self._auto_height = True
         self._last_height = 0
+        # WebEngine 在一次宽度变化中会连续抛出多次 resize；合并测高请求，
+        # 否则每次结果又会反过来触发外层列表重排，形成上下抖动。
+        self._measure_timer = QTimer(self)
+        self._measure_timer.setSingleShot(True)
+        self._measure_timer.setInterval(45)
+        self._measure_timer.timeout.connect(self.measure_content_height)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        # 在网页完成首次排版前不能使用 QWebEngine 默认的巨大 sizeHint，
+        # 否则外层可排序列表会把一行文字错误地固定成一大块空白。
+        self.setFixedHeight(34)
         self.loadFinished.connect(self.page_loaded)
+
+    def minimumSizeHint(self) -> QSize:  # type: ignore[override]
+        # QWebEngine 默认把网页的理想画布宽度（常为 800px 以上）作为最小宽度，
+        # 会反向撑破 QScrollArea 和卡片。正文宽度必须由 Qt 布局分配。
+        return QSize(0, max(1, self.height()))
+
+    def sizeHint(self) -> QSize:  # type: ignore[override]
+        # 只提供一个温和的首选宽度，不把浏览器内部 viewport 泄漏给父布局。
+        return QSize(120, max(1, self.height()))
 
     def page_loaded(self, _ok: bool) -> None:
         # KaTeX 与字体均从本地资源加载；再校准一次，避免首次排版后裁掉分式上下部分。
-        self.measure_content_height()
-        QTimer.singleShot(80, self.measure_content_height)
+        self.lock_document_width()
+        self.schedule_measure(0)
+        QTimer.singleShot(120, self.lock_document_width)
+        QTimer.singleShot(120, lambda: self.schedule_measure(0))
 
     def set_auto_height(self, enabled: bool) -> None:
         self._auto_height = enabled
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if self._auto_height:
-            QTimer.singleShot(0, self.measure_content_height)
+        # 自己 setFixedHeight 后也会收到一次 resize；只有宽度会改变折行，
+        # 高度变化绝不能再次触发测量，否则会与外层列表形成反馈循环。
+        if self._auto_height and event.size().width() != event.oldSize().width():
+            self.lock_document_width()
+            self.schedule_measure()
 
-    def set_content(self, text: str, placeholder: str, compact: bool = False) -> None:
+    def lock_document_width(self) -> None:
+        """把 Chromium 的排版 viewport 锁为 Qt 分配给控件的实际宽度。
+
+        不能使用 ``window.innerWidth`` 作为来源：部分 WebEngine 页面会在被嵌入
+        QListWidget 后仍报告初始的默认画布宽度，正是长文本越过卡片右边界的原因。
+        Qt 的 widget width 才是唯一可信的列宽。
+        """
+        width = max(1, self.width())
+        self.page().runJavaScript(f"""
+            (() => {{
+                const width = {width};
+                const root = document.documentElement;
+                const body = document.body;
+                const content = document.getElementById('content');
+                if (!body || !content) return;
+                for (const node of [root, body, content]) {{
+                    node.style.setProperty('width', width + 'px', 'important');
+                    node.style.setProperty('max-width', width + 'px', 'important');
+                    node.style.setProperty('min-width', '0px', 'important');
+                }}
+                content.style.setProperty('white-space', 'normal', 'important');
+                content.style.setProperty('overflow-wrap', 'anywhere', 'important');
+                content.style.setProperty('word-break', 'break-all', 'important');
+                content.querySelectorAll('p').forEach((node) => {{
+                    node.style.setProperty('width', '100%', 'important');
+                    node.style.setProperty('max-width', '100%', 'important');
+                    node.style.setProperty('white-space', 'normal', 'important');
+                    node.style.setProperty('overflow-wrap', 'anywhere', 'important');
+                    node.style.setProperty('word-break', 'break-all', 'important');
+                }});
+            }})();
+        """)
+
+    def set_content(self, text: str, placeholder: str, compact: bool = False, allow_wrap: bool = False) -> None:
         self._last_height = 0
-        self.setHtml(render_math_field_document(text, placeholder, compact), katex_base_url())
+        self.setHtml(render_math_field_document(text, placeholder, compact, allow_wrap), katex_base_url())
+
+    def schedule_measure(self, delay: int = 45) -> None:
+        if not self._auto_height:
+            return
+        if delay <= 0:
+            self._measure_timer.stop()
+            QTimer.singleShot(0, self.measure_content_height)
+        else:
+            self._measure_timer.start(delay)
 
     def measure_content_height(self) -> None:
         if not self._auto_height:
@@ -2123,8 +2806,27 @@ class ClickableMathView(QWebEngineView):
             (() => {
                 const node = document.getElementById('content');
                 if (!node) return 32;
+                // QWebEngine 可能保留首次加载时的默认 viewport，即使 Qt 外层
+                // 已经缩窄。用当前真实视口宽度强制根节点重新排版，避免连续
+                // 无空格文本从卡片右边溢出；所有栏目共用这一处逻辑。
+                const width = Math.max(1, document.getElementById('content').clientWidth || 1);
+                document.documentElement.style.setProperty('width', width + 'px', 'important');
+                document.documentElement.style.setProperty('max-width', width + 'px', 'important');
+                document.body.style.setProperty('width', width + 'px', 'important');
+                document.body.style.setProperty('max-width', width + 'px', 'important');
+                node.style.setProperty('width', width + 'px', 'important');
+                node.style.setProperty('max-width', width + 'px', 'important');
+                node.style.setProperty('overflow-wrap', 'anywhere', 'important');
+                node.style.setProperty('word-break', 'break-all', 'important');
+                const paragraphHeight = [...node.querySelectorAll('p')].reduce(
+                    (height, paragraph) => Math.max(height, paragraph.scrollHeight, paragraph.getBoundingClientRect().height),
+                    0
+                );
                 const style = getComputedStyle(document.body);
-                const contentHeight = Math.max(node.getBoundingClientRect().height, node.scrollHeight);
+                const contentHeight = Math.max(
+                    node.scrollHeight,
+                    paragraphHeight
+                );
                 return Math.ceil(contentHeight + parseFloat(style.paddingTop) + parseFloat(style.paddingBottom) + 2);
             })();
         """
@@ -2136,7 +2838,13 @@ class ClickableMathView(QWebEngineView):
             height = max(34, min(760, int(float(value))))
         except (TypeError, ValueError):
             return
-        if height == self._last_height:
+        if self.parent() is not None and hasattr(self.parent(), "compact_wrap_height"):
+            # FormulaTextEdit 的保底估算与网页精确高度取较大值，避免 Chromium
+            # 刚完成换行时暂时上报旧高度而裁掉最后一行。
+            height = max(height, self.parent().compact_wrap_height(self.width()))
+        # 浏览器的分数像素取整偶尔会在相邻两个值间摆动；1px 以内不应触发
+        # 整个列表重新排版。
+        if abs(height - self._last_height) <= 1:
             return
         self._last_height = height
         self.setFixedHeight(height)
@@ -2272,21 +2980,31 @@ class SourceImagePreview(QLabel):
 class FormulaTextEdit(QWidget):
     """静态时只展示排版结果；编辑时并排保留源码输入与实时 KaTeX 预览。"""
     textChanged = Signal()
+    editing_started = Signal()
+    editing_finished = Signal()
     screenshot_request_handler = None
     screenshot_open_handler = None
     image_request_handler = None
     edit_request_handler = None
 
-    def __init__(self, parent=None, single_line: bool = False):
+    def __init__(self, parent=None, single_line: bool = False, wrap_display: bool = False):
         super().__init__(parent)
         self._raw_text = ""
         self._single_line = single_line
+        # 紧凑编辑器仍可保持单行源码输入，但阅读态允许占满行宽后自然折行。
+        self._wrap_display = wrap_display
         self._placeholder = ""
         self._media_mode = False
         self.preview_timer = QTimer(self)
         self.preview_timer.setSingleShot(True)
         self.preview_timer.setInterval(140)
         self.preview_timer.timeout.connect(self.refresh_view)
+        # 多行源码编辑器的高度要跟随换行后的文档真实高度。以前外层只读取
+        # Web 预览的高度，进入编辑态时它已经被隐藏，动作栏便会被裁成一条。
+        self.editor_height_timer = QTimer(self)
+        self.editor_height_timer.setSingleShot(True)
+        self.editor_height_timer.setInterval(0)
+        self.editor_height_timer.timeout.connect(self.sync_editor_edit_height)
         self.setObjectName("mathField")
         # QWebEngineView 会给出很大的首选宽度；单行表格中必须允许布局把它压缩。
         self.setMinimumWidth(0)
@@ -2326,10 +3044,12 @@ class FormulaTextEdit(QWidget):
         self._capture_in_progress = False
         if single_line:
             self._single_display_height = 40
-            # 源码编辑和阅读态保持同高，紧凑列表编辑时不会反复推挤页面。
+            # 阅读态保持紧凑；编辑态允许源码随实际宽度换行，不能把长内容
+            # 截在输入框右端。
             self._single_edit_height = self._single_display_height
             self.editor.setFixedHeight(self._single_display_height)
-            self.editor.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+            self.editor.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+            self.editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             self.editor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             line = QHBoxLayout()
             line.setContentsMargins(0, 0, 0, 0)
@@ -2342,10 +3062,19 @@ class FormulaTextEdit(QWidget):
             self.done.setVisible(False)
             line.addWidget(self.insert_screenshot)
             edit_layout.addLayout(line)
-            self.view.setFixedHeight(self._single_display_height)
-            self.view.set_auto_height(False)
-            self.setFixedHeight(self._single_display_height)
+            if wrap_display:
+                self.view.set_auto_height(True)
+                self.view.setMinimumHeight(self._single_display_height)
+                self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            else:
+                self.view.setFixedHeight(self._single_display_height)
+                self.view.set_auto_height(False)
+                self.setFixedHeight(self._single_display_height)
         else:
+            self.editor.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+            self.editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.editor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.editor.setMinimumHeight(72)
             edit_layout.addWidget(self.editor)
             actions = QHBoxLayout()
             actions.addStretch()
@@ -2361,6 +3090,25 @@ class FormulaTextEdit(QWidget):
     def toPlainText(self) -> str:  # type: ignore[override]
         return self._raw_text
 
+    def minimumSizeHint(self) -> QSize:  # type: ignore[override]
+        # 宽度必须为 0，允许紧凑卡片收缩；高度则不能也返回 0。列表在计算
+        # 行高时需要知道 WebEngine 已经渲染出的真实多行高度，否则第二行会
+        # 虽然完成换行却被父 QListWidget 截掉。
+        view_height = self.view.height() if hasattr(self, "view") else 0
+        attachment_height = self.attachments.sizeHint().height() if getattr(self, "attachments", None) and self.attachments.isVisible() else 0
+        edit_height = self.edit_holder.sizeHint().height() if getattr(self, "edit_holder", None) and self.edit_holder.isVisible() else 0
+        # 不读取内部 QWebEngineView 的 sizeHint：它在尚未排版时会谎报数百像素
+        # 的默认画布高度。这里只传播已设置到 view 的真实高度。
+        return QSize(0, max(1, self.minimumHeight(), view_height + attachment_height, edit_height))
+
+    def sizeHint(self) -> QSize:  # type: ignore[override]
+        # 与 ClickableMathView 一样，外层只能依据可用宽度布局。高度由紧凑字段
+        # 的保底行高或网页实测高度决定，宽度绝不能由浏览器的默认画布决定。
+        if getattr(self, "edit_holder", None) and self.edit_holder.isVisible():
+            return QSize(120, max(1, self.edit_holder.sizeHint().height()))
+        height = self.view.height() if hasattr(self, "view") else 34
+        return QSize(120, max(1, height))
+
     def text(self) -> str:
         return self._raw_text
 
@@ -2372,6 +3120,8 @@ class FormulaTextEdit(QWidget):
         self.editor.blockSignals(True)
         self.editor.setPlainText(self._raw_text)
         self.editor.blockSignals(False)
+        self.ensure_compact_wrap_height()
+        self.schedule_editor_height_sync()
         self.refresh_view()
 
     def setPlaceholderText(self, text: str) -> None:
@@ -2385,16 +3135,136 @@ class FormulaTextEdit(QWidget):
         if not self._single_line:
             self.editor.setMinimumHeight(height)
 
-    def _display_height_changed(self, _height: int) -> None:
+    def schedule_editor_height_sync(self) -> None:
+        self.editor_height_timer.start()
+
+    def sync_editor_edit_height(self) -> None:
+        """让编辑框完整容纳源码和操作栏，避免被隐藏预览的旧高度裁掉。"""
+        if not self.edit_holder.isVisible():
+            return
+        viewport_width = max(1, self.editor.viewport().width())
+        document = self.editor.document()
+        document.setTextWidth(viewport_width)
+        doc_height = math.ceil(document.documentLayout().documentSize().height())
+        margins = self.editor.contentsMargins()
+        # QTextEdit 在刚切入编辑态时偶尔会先按一行报告 documentSize，随后
+        # 才完成真实的软换行。多行时额外保留一个行高，既避免最后一行贴着
+        # 下边缘被裁掉，也不会影响阅读态的紧凑高度。
+        line_height = max(1, self.editor.fontMetrics().lineSpacing())
+        visual_lines = max(1, math.ceil(doc_height / line_height))
+        safety_height = line_height if visual_lines > 1 else 0
+        target_height = max(
+            self._single_edit_height if self._single_line else self.editor.minimumHeight(),
+            doc_height + margins.top() + margins.bottom() + 12 + safety_height,
+        )
+        height_changed = self.editor.height() != target_height
+        if height_changed:
+            self.editor.setFixedHeight(target_height)
+        # 阅读态曾把紧凑字段压到 40px；在嵌套的 QHBoxLayout 中，仅更新
+        # sizeHint 不会覆盖这个旧约束。编辑态直接提高字段本身的最小高度，
+        # 让父卡片至少能够容纳完整源码输入区。
+        field_target = max(target_height, self.edit_holder.sizeHint().height())
+        if self.minimumHeight() != field_target:
+            QWidget.setMinimumHeight(self, field_target)
+        self.updateGeometry()
+        # 仅更新字段自身的几何信息还不够：问题串的追问位于嵌套 ReorderList
+        # 中，父布局不会自动重新询问该卡片的高度，第二行就会被旧卡片高度
+        # 裁掉。高度实际变化时重新走一次统一的列表重排通知链。
+        if height_changed:
+            self.textChanged.emit()
+            # 让 Qt 以新的编辑器高度完成一次布局后再精确测量。此调用不会
+            # 反复增高：第二次若高度不变就不会再发出通知。
+            QTimer.singleShot(18, self.schedule_editor_height_sync)
+
+    def outer_scroll_area(self) -> QScrollArea | None:
+        """返回包裹当前字段的笔记滚动区；编辑时不应让它自行跳位。"""
+        parent = self.parentWidget()
+        while parent is not None:
+            if isinstance(parent, QScrollArea):
+                return parent
+            parent = parent.parentWidget()
+        return None
+
+    @staticmethod
+    def restore_scroll_position(area: QScrollArea | None, value: int) -> None:
+        if area is None:
+            return
+        bar = area.verticalScrollBar()
+        bar.setValue(max(bar.minimum(), min(value, bar.maximum())))
+
+    def preserve_outer_scroll_after_layout(self, value: int) -> None:
+        """焦点和动态测高完成后恢复原阅读位置，避免点击备注突然跳到页底。"""
+        area = self.outer_scroll_area()
+        if area is None:
+            return
+        QTimer.singleShot(0, lambda current=area, saved=value: self.restore_scroll_position(current, saved))
+        # QTextEdit 获得焦点后还会有一次延迟的 ensureVisible；再恢复一次。
+        QTimer.singleShot(45, lambda current=area, saved=value: self.restore_scroll_position(current, saved))
+
+    def compact_wrap_height(self, width: int | None = None) -> int:
+        """紧凑阅读态的保底高度。
+
+        Chromium 的 ``scrollHeight`` 有时会在刚调整了 QListWidget 条目宽度时仍
+        返回旧的一行高度。此处只用源码和控件真实宽度估算可见行数，确保页面
+        不会先被裁掉；随后浏览器的精确结果会取两者较大值。
+        """
+        if not (self._single_line and self._wrap_display):
+            return 34
+        available = max(1, width if width is not None else self.width())
+        # 16px 正文在中英混排下约每 15px 占一个汉字宽；刻意略保守，使行内
+        # 公式、删除按钮旁边的窄标题也不会丢掉最后一行。
+        # 宽度不足时宁可先多预留一行，也绝不能把第二行裁掉；网页精确测量
+        # 完成后再以真实 ``scrollHeight`` 校准。
+        capacity = max(8, (available - 16) // 12)
+        normalized = SCREENSHOT_TOKEN.sub("", self._raw_text)
+        # LaTex 源码长度远大于它的视觉宽度；折算后避免仅因命令字符而产生空行。
+        normalized = FORMULA_PATTERN.sub(
+            lambda match: "□" * max(4, min(12, round(len(match.group(1).strip()) * 0.55))),
+            normalized,
+        )
+        lines = 0
+        for paragraph in normalized.splitlines() or [""]:
+            lines += max(1, math.ceil(max(1, len(paragraph)) / capacity))
+        return max(34, 10 + lines * 24)
+
+    def ensure_compact_wrap_height(self) -> None:
+        if not (self._single_line and self._wrap_display):
+            return
+        height = self.compact_wrap_height()
+        # 这里只能作为网页首次重排前的“最低安全高度”，绝不能把 WebEngine
+        # 已测得的多行真实高度再压回估算值；后者正会造成第二行内容被裁掉。
+        if self.view.height() >= height:
+            return
+        self.view.setFixedHeight(height)
         self.updateGeometry()
         self.textChanged.emit()
+
+    def _display_height_changed(self, _height: int) -> None:
+        # 公式测高不能低于源码宽度推导出的保底值；否则第二行会在视觉上已出现，
+        # 但 QListWidget 仍只保留第一行的高度。
+        self.ensure_compact_wrap_height()
+        # QHBoxLayout 不会总是因为其内嵌 WebEngine 的 sizeHint 改变而重算行高。
+        # 对无附件的紧凑字段，将网页已经测得的真实高度同步到字段本身，保证
+        # 放在“抓手－内容－删除”同一行的标题/追问也能完整显示全部换行。
+        if self._single_line and self._wrap_display and not self._media_mode and not self.edit_holder.isVisible():
+            actual_height = max(self.view.height(), self.compact_wrap_height(self.width()))
+            if self.height() != actual_height:
+                self.setFixedHeight(actual_height)
+        self.updateGeometry()
+        self.textChanged.emit()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if event.size().width() != event.oldSize().width():
+            self.ensure_compact_wrap_height()
+            self.schedule_editor_height_sync()
 
     def _configure_single_line_media_mode(self, enabled: bool) -> None:
         """紧凑表格默认单行；插入教材截图后自动展开，不能用单行高度裁掉图片。"""
         if not self._single_line:
             return
         self._media_mode = enabled
-        if enabled:
+        if enabled or self._wrap_display:
             self.view.set_auto_height(True)
             self.view.setMinimumHeight(self._single_display_height)
             self.view.setMaximumHeight(760)
@@ -2413,6 +3283,8 @@ class FormulaTextEdit(QWidget):
         guard = type(self).edit_request_handler
         if callable(guard) and not guard(self):
             return
+        area = self.outer_scroll_area()
+        scroll_value = area.verticalScrollBar().value() if area is not None else 0
         self.editor.blockSignals(True)
         self.editor.setPlainText(self._raw_text)
         self.editor.blockSignals(False)
@@ -2421,10 +3293,14 @@ class FormulaTextEdit(QWidget):
         self.edit_holder.setVisible(True)
         if self._single_line:
             self._configure_single_line_media_mode(bool(SCREENSHOT_TOKEN.search(self._raw_text)))
+        self.schedule_editor_height_sync()
         self.editor.setFocus()
         self.editor.moveCursor(QTextCursor.MoveOperation.End)
+        self.editing_started.emit()
         # 通知外层可排序卡片重新计算高度，防止编辑器被列表裁切。
+        self.updateGeometry()
         self.textChanged.emit()
+        self.preserve_outer_scroll_after_layout(scroll_value)
 
     def eventFilter(self, watched, event) -> bool:
         if watched is self.editor and event.type() == QEvent.Type.FocusOut:
@@ -2437,19 +3313,33 @@ class FormulaTextEdit(QWidget):
             self.finish_editing()
 
     def finish_editing(self) -> None:
+        was_editing = self.edit_holder.isVisible()
         self.preview_timer.stop()
         self._raw_text = self.editor.toPlainText()
         self.edit_holder.setVisible(False)
         self.view.setVisible(True)
         if self._single_line:
+            self.editor.setFixedHeight(self._single_edit_height)
+            QWidget.setMinimumHeight(self, self._single_display_height)
             self._configure_single_line_media_mode(bool(SCREENSHOT_TOKEN.search(self._raw_text)))
+            # 阅读态恢复前先按当前字段宽度给出稳定的保底高度；不把首次换行
+            # 的正确尺寸完全交给异步网页回调。
+            self.ensure_compact_wrap_height()
+        else:
+            # 多行字段的阅读态高度完全由渲染内容决定，不继承编辑期高度。
+            QWidget.setMinimumHeight(self, 0)
         self.refresh_view()
+        if was_editing:
+            self.editing_finished.emit()
+        self.updateGeometry()
         self.textChanged.emit()
 
     def _source_changed(self) -> None:
         self._raw_text = self.editor.toPlainText()
+        self.schedule_editor_height_sync()
         if self.edit_holder.isVisible() and self.view.isVisible():
             self.preview_timer.start()
+        self.updateGeometry()
         self.textChanged.emit()
 
     def request_screenshot(self) -> None:
@@ -2509,7 +3399,7 @@ class FormulaTextEdit(QWidget):
         self.refresh_attachments()
         # 位图由原生附件区显示；网页预览中直接移除内部标记，不向用户暴露实现细节。
         preview_text = SCREENSHOT_TOKEN.sub("", self._raw_text)
-        self.view.set_content(preview_text, self._placeholder, self._single_line)
+        self.view.set_content(preview_text, self._placeholder, self._single_line, self._wrap_display)
 
     def refresh_attachments(self) -> None:
         while self.attachments_layout.count():
@@ -2578,10 +3468,15 @@ class BaseCard(QFrame):
         self.remove_callback = remove_callback
         self.changed_callback = changed_callback
         self.setObjectName("noteItem")
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+        # 任何一个字段（尤其是 WebEngine 初次加载时报告的超宽 sizeHint）都
+        # 不能把整张卡片撑出中间栏。高度仍完全交给内容和布局计算。
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.layout_box = QVBoxLayout(self)
-        self.layout_box.setContentsMargins(12, 10, 12, 11)
-        self.layout_box.setSpacing(7)
+        # 卡片本身已经有边框，内部只留最小的呼吸空间，避免短条目看起来像
+        # 一块过高的空白面板。
+        self.layout_box.setContentsMargins(12, 7, 12, 7)
+        self.layout_box.setSpacing(6)
         self._drag_handler = None
 
     def add_remove_row(self, _label: str = "") -> QHBoxLayout:
@@ -2592,7 +3487,10 @@ class BaseCard(QFrame):
         hidden_caption_slot = QWidget()
         hidden_caption_slot.setFixedSize(0, 0)
         row.addWidget(hidden_caption_slot)
-        row.addStretch()
+        # 没有行内字段的卡片仍可把“删除”推到右侧；一旦 Compact/例题卡把
+        # 标题字段插到这里，字段自身的 stretch=1 会独占全部余宽。旧代码把
+        # 这个空白项也设为 stretch=1，恰好吞掉了一半行宽。
+        row.addStretch(0)
         remove = QPushButton("删除")
         remove.setObjectName("removeAction")
         remove.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
@@ -2623,6 +3521,28 @@ class BaseCard(QFrame):
     def changed(self, *_args) -> None:
         self.changed_callback()
 
+    def refresh_content_height(self) -> None:
+        """将嵌套字段的最新高度落实到卡片本身。
+
+        Qt 在 ``QScrollArea → ReorderList → 问题卡 → 追问卡`` 这种多层
+        布局中，不会总是把 QTextEdit 事后的 sizeHint 重新向上传播。卡片若
+        仍保留旧的最小高度，第二行源码就会被边框裁掉。这里每次重排都以内部
+        布局的真实最小高度刷新卡片约束，阅读态和编辑态共用同一条路径。
+        """
+        self.layout_box.invalidate()
+        self.layout_box.activate()
+        target = max(0, self.layout_box.minimumSize().height(), self.layout_box.sizeHint().height())
+        if self.minimumHeight() != target:
+            QWidget.setMinimumHeight(self, target)
+        self.updateGeometry()
+
+    def minimumSizeHint(self) -> QSize:  # type: ignore[override]
+        # 高度由内部字段决定，横向永远可以压缩到父编辑栏实际给出的宽度。
+        return QSize(0, max(0, self.layout_box.minimumSize().height()))
+
+    def sizeHint(self) -> QSize:  # type: ignore[override]
+        return QSize(160, max(0, self.layout_box.sizeHint().height()))
+
     def preview_text(self) -> str:
         return ""
 
@@ -2637,7 +3557,7 @@ class TitleContentCard(BaseCard):
     def __init__(self, item: dict, remove_callback, changed_callback, parent=None):
         super().__init__(remove_callback, changed_callback, parent)
         self.add_remove_row("拖动排序")
-        self.title = FormulaTextEdit(single_line=True)
+        self.title = FormulaTextEdit(single_line=True, wrap_display=True)
         self.title.setPlainText(str(item.get("title", "")))
         self.title.setPlaceholderText("标题（支持 LaTeX）")
         self.content = FormulaTextEdit()
@@ -2682,33 +3602,51 @@ class ReferenceContentCard(BaseCard):
 
 
 def configure_compact_cell(field: FormulaTextEdit, minimum_width: int) -> None:
-    """让紧凑列表的每一列既有可读下限，也能从 WebEngine 的首选宽度收缩。"""
-    field.setMinimumWidth(minimum_width)
-    field.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+    """紧凑阅读字段的统一布局策略：占满余宽，余宽不够时折行。"""
+    # ``minimum_width`` 是旧调用点保留的兼容参数。卡片阅读不能再设置硬最小宽度，
+    # 否则任意一个栏目在窄栏中都会截断，或把网页的真实宽度计算带偏。
+    del minimum_width
+    field.setMinimumWidth(0)
+    field.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
     field.view.setMinimumWidth(0)
-    field.view.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+    field.view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     field.edit_holder.setMinimumWidth(0)
     field.editor.setMinimumWidth(0)
-    field.editor.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+    field.editor.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
 
 class CompactKnowledgeCard(BaseCard):
-    """知识点主界面的紧凑行：完整内容交给栏目级“查看全部”。"""
+    """知识点主界面：标题读写均使用完整行宽，长公式或文字自然换行。"""
     def __init__(self, item: dict, remove_callback, changed_callback, parent=None):
         super().__init__(remove_callback, changed_callback, parent)
         row = self.add_remove_row("拖动排序")
-        self.title = FormulaTextEdit(single_line=True)
+        # 源码编辑保持一行，阅读态允许用尽可用宽度后自然折行。
+        # 这既不会截断长内容，也不会让短内容继承正文编辑器的高尺寸。
+        self.title = FormulaTextEdit(single_line=True, wrap_display=True)
         self.title.setPlainText(str(item.get("title", "")))
         self.title.setPlaceholderText("知识点标题")
-        self.content = FormulaTextEdit(single_line=True)
+        self.content = FormulaTextEdit(single_line=True, wrap_display=True)
         self.content.setPlainText(str(item.get("content", "")))
         self.content.setPlaceholderText("知识点内容")
-        configure_compact_cell(self.title, 180)
-        configure_compact_cell(self.content, 240)
-        row.insertWidget(2, self.title, 2)
-        row.insertWidget(3, self.content, 4)
+        # 标题位于抓手和删除按钮之间，优先获得整行宽度；内容在下方全文展示。
+        self.title.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        row.insertWidget(2, self.title, 1)
+        self.layout_box.addWidget(self.content)
+        self._compact_fields = (self.title, self.content)
+        for field in self._compact_fields:
+            field.editing_started.connect(self.update_content_visibility)
+            field.editing_finished.connect(lambda: QTimer.singleShot(0, self.update_content_visibility))
         self.track(self.title)
         self.track(self.content)
+        self.update_content_visibility()
+
+    def update_content_visibility(self) -> None:
+        # 空的附加内容不能因为编辑标题而凭空占出一大块空间。只有已有内容，
+        # 或用户实际点进“内容”字段时才显示这一行。
+        content_editing = self.content.edit_holder.isVisible()
+        self.content.setVisible(content_editing or bool(self.content.toPlainText().strip()))
+        self.updateGeometry()
 
     def is_empty(self) -> bool:
         return not self.title.toPlainText().strip() and not self.content.toPlainText().strip()
@@ -2721,7 +3659,7 @@ class PatternCard(BaseCard):
     def __init__(self, item: dict, remove_callback, changed_callback, parent=None):
         super().__init__(remove_callback, changed_callback, parent)
         self.add_remove_row("题型卡 · 拖动排序")
-        self.title = FormulaTextEdit(single_line=True)
+        self.title = FormulaTextEdit(single_line=True, wrap_display=True)
         self.title.setPlainText(str(item.get("title", "")))
         self.title.setPlaceholderText("题型名称（支持 LaTeX）")
         self.example = FormulaTextEdit()
@@ -2751,44 +3689,55 @@ class PatternCard(BaseCard):
 
 
 class CompactPatternCard(BaseCard):
-    """题型主界面的紧凑行：题型、示例、备注三列并排。"""
+    """基本题型与知识点共用轻量卡片：题型名 + 可选补充内容。"""
     def __init__(self, item: dict, remove_callback, changed_callback, parent=None):
         super().__init__(remove_callback, changed_callback, parent)
         row = self.add_remove_row("拖动排序")
-        self.title = FormulaTextEdit(single_line=True)
+        self.title = FormulaTextEdit(single_line=True, wrap_display=True)
         self.title.setPlainText(str(item.get("title", "")))
         self.title.setPlaceholderText("题型")
-        self.example = FormulaTextEdit(single_line=True)
-        self.example.setPlainText(str(item.get("example", "")))
-        self.example.setPlaceholderText("示例")
-        self.note = FormulaTextEdit(single_line=True)
-        self.note.setPlainText(str(item.get("note", "")))
-        self.note.setPlaceholderText("备注")
-        configure_compact_cell(self.title, 150)
-        configure_compact_cell(self.example, 170)
-        configure_compact_cell(self.note, 170)
-        row.insertWidget(2, self.title, 2)
-        row.insertWidget(3, self.example, 3)
-        row.insertWidget(4, self.note, 3)
+        # 旧数据中的示例、备注合并为一个可选内容字段，文本不会丢失；新版不再
+        # 展示两行用途不清的空字段。
+        legacy_parts = [str(item.get("content", "")).strip(), str(item.get("example", "")).strip(), str(item.get("note", "")).strip()]
+        self.content = FormulaTextEdit(single_line=True, wrap_display=True)
+        self.content.setPlainText("\n".join(part for part in legacy_parts if part))
+        self.content.setPlaceholderText("")
+        self.title.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        row.insertWidget(2, self.title, 1)
+        self.layout_box.addWidget(self.content)
+        self._compact_fields = (self.title, self.content)
+        for field in self._compact_fields:
+            field.editing_started.connect(self.update_content_visibility)
+            field.editing_finished.connect(lambda: QTimer.singleShot(0, self.update_content_visibility))
         self.track(self.title)
-        self.track(self.example)
-        self.track(self.note)
+        self.track(self.content)
+        self.update_content_visibility()
+
+    def update_content_visibility(self) -> None:
+        content_editing = self.content.edit_holder.isVisible()
+        self.content.setVisible(content_editing or bool(self.content.toPlainText().strip()))
+        self.updateGeometry()
 
     def is_empty(self) -> bool:
-        return not any((self.title.toPlainText().strip(), self.example.toPlainText().strip(), self.note.toPlainText().strip()))
+        return not any((self.title.toPlainText().strip(), self.content.toPlainText().strip()))
 
     def data(self) -> dict:
-        return {"title": self.title.toPlainText().strip(), "example": self.example.toPlainText().strip(), "note": self.note.toPlainText().strip()}
+        return {"title": self.title.toPlainText().strip(), "content": self.content.toPlainText().strip()}
 
 
 class ExampleCard(BaseCard):
     def __init__(self, item: dict, remove_callback, changed_callback, parent=None):
         super().__init__(remove_callback, changed_callback, parent)
-        self.add_remove_row("例题卡 · 拖动排序")
-        self.title = FormulaTextEdit(single_line=True)
+        # 标题放在抓手同行，编辑第一眼即可知道两行分别记录什么。
+        header = self.add_remove_row("例题卡 · 拖动排序")
+        self.title = FormulaTextEdit(single_line=True, wrap_display=True)
         self.title.setPlainText(str(item.get("title", "")))
         self.title.setPlaceholderText("例题标题（支持 LaTeX）")
-        self.source = FormulaTextEdit(single_line=True)
+        title_label = field_label("标题")
+        header.insertWidget(2, title_label)
+        header.insertWidget(3, self.title, 1)
+        self.source = FormulaTextEdit(single_line=True, wrap_display=True)
         self.source.setPlainText(str(item.get("source", "")))
         self.source.setPlaceholderText("来源（教材页码、试卷或资料；支持 LaTeX）")
         self.problem = FormulaTextEdit()
@@ -2799,8 +3748,12 @@ class ExampleCard(BaseCard):
         self.note.setPlainText(str(item.get("note", "")))
         self.note.setPlaceholderText("备注：关键处理、为何保留或课堂使用提示")
         self.note.setMinimumHeight(66)
-        self.layout_box.addWidget(self.title)
-        self.layout_box.addWidget(self.source)
+        source_row = QHBoxLayout()
+        source_row.setContentsMargins(0, 0, 0, 0)
+        source_row.setSpacing(8)
+        source_row.addWidget(field_label("来源"))
+        source_row.addWidget(self.source, 1)
+        self.layout_box.addLayout(source_row)
         self.layout_box.addWidget(field_label("原题"))
         self.layout_box.addWidget(self.problem)
         self.layout_box.addWidget(field_label("备注"))
@@ -2847,7 +3800,7 @@ class FollowupCard(BaseCard):
         self.tag = ReorderTag(self)
         self.tag.setMinimumWidth(58)
         row.addWidget(self.tag)
-        self.text = FormulaTextEdit(single_line=True)
+        self.text = FormulaTextEdit(single_line=True, wrap_display=True)
         self.text.setPlainText(str(item.get("text", "")))
         self.text.setPlaceholderText("追问")
         configure_compact_cell(self.text, 160)
@@ -2873,132 +3826,226 @@ class FollowupCard(BaseCard):
         return {"text": self.text.toPlainText().strip()}
 
 
-class ReorderList(QListWidget):
-    """以 QListWidget 的 InternalMove 提供可靠的卡片拖拽排序。"""
+class ReorderList(QFrame):
+    """普通流式卡片容器。
+
+    旧实现把每张卡放进 ``QListWidget`` 并手工反复测量、固定行高。公式网页在
+    异步换行后会再改变高度，嵌套问题串就形成“测量—裁剪—再测量”的循环。这里
+    只使用一个正常的 ``QVBoxLayout``：卡片拥有真实宽度、内容自然换行，整个
+    中间笔记页是唯一允许滚动的地方。
+    """
+    MIME_TYPE = "application/x-textbook-notebook-card"
+
     def __init__(self, card_type, on_change, parent=None):
         super().__init__(parent)
         self.card_type = card_type
         self.on_change = on_change
-        self._cards: dict[int, BaseCard] = {}
+        self._cards: list[BaseCard] = []
+        self._drag_card: BaseCard | None = None
+        self._drop_index: int | None = None
         self.setObjectName("cardList")
-        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self.setDragEnabled(True)
         self.setAcceptDrops(True)
-        self.setDropIndicatorShown(True)
-        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setSpacing(8)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.model().rowsMoved.connect(self.reordered)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.cards_layout = QVBoxLayout(self)
+        self.cards_layout.setContentsMargins(0, 0, 0, 0)
+        self.cards_layout.setSpacing(6)
+        self.drop_indicator = QFrame(self)
+        self.drop_indicator.setObjectName("dropIndicator")
+        self.drop_indicator.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.drop_indicator.setFixedHeight(3)
+        self.drop_indicator.hide()
+        self._reflow_timer = QTimer(self)
+        self._reflow_timer.setSingleShot(True)
+        self._reflow_timer.setInterval(35)
+        self._reflow_timer.timeout.connect(self.refresh_height)
 
     def add_data(self, data: dict | None = None, notify: bool = True) -> None:
-        item = QListWidgetItem()
-        card = self.card_type(data or {}, lambda: self.remove_card(item), lambda: self.card_changed(item))
-        card.set_drag_handler(lambda: self.start_card_drag(item))
-        self._cards[id(item)] = card
-        item.setSizeHint(card.sizeHint())
-        self.addItem(item)
-        self.setItemWidget(item, card)
+        card: BaseCard | None = None
+
+        def remove_current() -> None:
+            if card is not None:
+                self.remove_card(card)
+
+        def changed_current() -> None:
+            if card is not None:
+                self.card_changed(card)
+
+        card = self.card_type(data or {}, remove_current, changed_current)
+        card.set_drag_handler(lambda current=card: self.start_card_drag(current))
+        card.setMinimumWidth(0)
+        card.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        for field in card.findChildren(FormulaTextEdit):
+            field.editing_started.connect(self.schedule_reflow)
+            field.editing_finished.connect(self.schedule_reflow)
+        self._cards.append(card)
+        self.cards_layout.addWidget(card)
+        self.reindex_cards()
         self.refresh_height()
         if notify:
             self.on_change()
 
-    def start_card_drag(self, item: QListWidgetItem) -> None:
-        if self.row(item) >= 0:
-            self.setCurrentItem(item)
-            self.startDrag(Qt.DropAction.MoveAction)
+    def setSpacing(self, spacing: int) -> None:
+        """保留原列表调用点；间距统一由普通纵向布局管理。"""
+        self.cards_layout.setSpacing(max(0, spacing))
+        self.refresh_height()
 
-    def remove_card(self, item: QListWidgetItem) -> None:
-        row = self.row(item)
-        if row >= 0:
-            self.takeItem(row)
-            self._cards.pop(id(item), None)
-            self.refresh_height()
-            self.on_change()
-
-    def card_changed(self, item: QListWidgetItem) -> None:
-        QTimer.singleShot(0, lambda: self.sync_item_size(item))
-        self.on_change()
-
-    def sync_item_size(self, item: QListWidgetItem) -> None:
-        if self.row(item) < 0:
+    def remove_card(self, card: BaseCard) -> None:
+        if card not in self._cards:
             return
-        card = self.itemWidget(item) or self._cards.get(id(item))
-        if card:
-            item.setSizeHint(card.sizeHint())
-        self.refresh_height()
-
-    def reordered(self, *_args) -> None:
-        self.restore_cards()
+        self._cards.remove(card)
+        self.cards_layout.removeWidget(card)
+        card.setParent(None)
+        card.deleteLater()
+        self.reindex_cards()
         self.refresh_height()
         self.on_change()
 
-    def dropEvent(self, event) -> None:
-        super().dropEvent(event)
-        QTimer.singleShot(0, self.restore_cards)
+    def card_changed(self, _card: BaseCard) -> None:
+        # 输入时不再写死任何列表高度；仅在下一轮事件循环中让标准布局重新协商。
+        self.schedule_reflow()
+        self.on_change()
 
-    def restore_cards(self) -> None:
-        """内部移动后重新绑定卡片，避免 Qt 丢失 itemWidget 引用。"""
-        for row in range(self.count()):
-            item = self.item(row)
-            if self.itemWidget(item) is None and id(item) in self._cards:
-                self.setItemWidget(item, self._cards[id(item)])
+    def schedule_reflow(self, *_args) -> None:
+        self._reflow_timer.start()
+
+    def refresh_height(self) -> None:
+        """兼容旧调用点的名字；不再固定高度，也不制造嵌套滚动条。"""
+        # 先让每张卡把字段（尤其是源码编辑框）的新高度写回自身。仅让最外层
+        # 布局 invalidate 在嵌套问题串中不足以更新追问卡的旧高度。
+        for card in self._cards:
+            card.refresh_content_height()
+        self.cards_layout.invalidate()
+        self.cards_layout.activate()
+        self.updateGeometry()
+        parent = self.parentWidget()
+        while parent is not None:
+            layout = parent.layout()
+            if layout is not None:
+                layout.invalidate()
+            parent.updateGeometry()
+            parent = parent.parentWidget()
+
+    def minimumSizeHint(self) -> QSize:  # type: ignore[override]
+        # QScrollArea 只应看到“可压缩到 0 的宽度 + 内容真实高度”；绝不能把
+        # 子卡片的宽大 sizeHint 变成整个编辑页的最小宽度。
+        return QSize(0, max(0, self.cards_layout.minimumSize().height()))
+
+    def sizeHint(self) -> QSize:  # type: ignore[override]
+        return QSize(120, max(0, self.cards_layout.sizeHint().height()))
 
     def set_data(self, entries: list[dict]) -> None:
-        self.clear()
+        for card in self._cards:
+            self.cards_layout.removeWidget(card)
+            card.deleteLater()
         self._cards.clear()
         for entry in entries or []:
             self.add_data(entry, notify=False)
+        self.reindex_cards()
         self.refresh_height()
 
     def values(self) -> list[dict]:
-        values = []
-        for row in range(self.count()):
-            item = self.item(row)
-            card = self.itemWidget(item) or self._cards.get(id(item))
-            if card and not card.is_empty():
-                values.append(card.data())
-        return values
+        return [card.data() for card in self._cards if not card.is_empty()]
 
-    def refresh_height(self) -> None:
-        # 先给隐藏状态或初次创建一个保守高度；真正高度随后由已绘制行的位置校准。
-        total = self.frameWidth() * 2 + 12
-        for row in range(self.count()):
-            item = self.item(row)
-            card = self.itemWidget(item) or self._cards.get(id(item))
-            if card and hasattr(card, "set_position"):
-                card.set_position(row + 1)
-            card_height = max(item.sizeHint().height(), card.sizeHint().height() if card else 0, card.minimumSizeHint().height() if card else 0)
-            item.setSizeHint(item.sizeHint().expandedTo(card.sizeHint() if card else item.sizeHint()))
-            total += card_height
-        total += max(0, self.count() - 1) * self.spacing()
-        self.setFixedHeight(max(2, total))
-        QTimer.singleShot(0, self.fit_height_to_rows)
+    def reindex_cards(self) -> None:
+        for position, card in enumerate(self._cards, start=1):
+            if hasattr(card, "set_position"):
+                card.set_position(position)
 
-    def fit_height_to_rows(self) -> None:
-        """按 QListWidget 实际绘制的最后一行校准高度，避免多项时出现微小内滚动。"""
-        if not self.isVisible() or not self.count():
+    def start_card_drag(self, card: BaseCard) -> None:
+        if card not in self._cards:
             return
-        self.verticalScrollBar().setValue(0)
-        last_rect = self.visualItemRect(self.item(self.count() - 1))
-        if not last_rect.isValid():
-            return
-        # rect 坐标相对 viewport；再加框线和少量下沿余量，确保最后一行完整露出。
-        target_height = last_rect.bottom() + 1 + self.frameWidth() * 2 + 6
-        if self.height() != target_height:
-            self.setFixedHeight(max(2, target_height))
+        self._drag_card = card
+        mime = QMimeData()
+        mime.setData(self.MIME_TYPE, str(self._cards.index(card)).encode("ascii"))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        # 仅显示半透明缩略图；真实卡片和其余布局完全不离开原位置，避免残影。
+        preview = card.grab()
+        if not preview.isNull():
+            drag.setPixmap(preview.scaled(QSize(420, 240), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        drag.exec(Qt.DropAction.MoveAction)
+        self.clear_drop_target()
+        self._drag_card = None
 
-    def showEvent(self, event) -> None:  # type: ignore[override]
-        super().showEvent(event)
-        QTimer.singleShot(0, self.fit_height_to_rows)
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData().hasFormat(self.MIME_TYPE) and self._drag_card in self._cards:
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if not (event.mimeData().hasFormat(self.MIME_TYPE) and self._drag_card in self._cards):
+            event.ignore()
+            return
+        index = self.drop_index_for_y(event.position().toPoint().y())
+        self.set_drop_target(index)
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+        self.clear_drop_target()
+        event.accept()
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        card = self._drag_card
+        target = self._drop_index
+        self.clear_drop_target()
+        if card is None or card not in self._cards or target is None:
+            event.ignore()
+            return
+        old = self._cards.index(card)
+        target = max(0, min(target, len(self._cards)))
+        if target > old:
+            target -= 1
+        if target != old:
+            self._cards.pop(old)
+            self._cards.insert(target, card)
+            self.cards_layout.removeWidget(card)
+            self.cards_layout.insertWidget(target, card)
+            self.reindex_cards()
+            self.refresh_height()
+            self.on_change()
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+
+    def drop_index_for_y(self, y: int) -> int:
+        for index, card in enumerate(self._cards):
+            if y < card.geometry().center().y():
+                return index
+        return len(self._cards)
+
+    def set_drop_target(self, index: int) -> None:
+        if index == self._drop_index:
+            return
+        self._drop_index = index
+        if not self._cards:
+            self.clear_drop_target()
+            return
+        if index < len(self._cards):
+            y = self._cards[index].geometry().top() - 2
+        else:
+            y = self._cards[-1].geometry().bottom() + self.cards_layout.spacing() - 1
+        self.drop_indicator.setGeometry(6, max(0, y), max(1, self.width() - 12), 3)
+        self.drop_indicator.raise_()
+        self.drop_indicator.show()
+
+    def clear_drop_target(self) -> None:
+        self._drop_index = None
+        self.drop_indicator.hide()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if event.size().width() != event.oldSize().width():
+            self.schedule_reflow()
 
 
 class QuestionCard(BaseCard):
     def __init__(self, item: dict, remove_callback, changed_callback, parent=None):
         super().__init__(remove_callback, changed_callback, parent)
         self.setObjectName("questionItem")
+        self.setMinimumWidth(0)
         self.layout_box.setContentsMargins(8, 5, 8, 5)
         self.layout_box.setSpacing(4)
         question_row = QHBoxLayout()
@@ -3007,7 +4054,7 @@ class QuestionCard(BaseCard):
         self.tag = ReorderTag(self)
         self.tag.setMinimumWidth(58)
         question_row.addWidget(self.tag)
-        self.question = FormulaTextEdit(single_line=True)
+        self.question = FormulaTextEdit(single_line=True, wrap_display=True)
         self.question.setPlainText(str(item.get("question", "")))
         self.question.setPlaceholderText("问题")
         configure_compact_cell(self.question, 220)
@@ -3026,6 +4073,8 @@ class QuestionCard(BaseCard):
         self.followups.setObjectName("followupList")
         self.followups.setSpacing(4)
         followup_holder = QWidget()
+        followup_holder.setMinimumWidth(0)
+        followup_holder.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         followup_layout = QVBoxLayout(followup_holder)
         followup_layout.setContentsMargins(22, 0, 0, 0)
         followup_layout.setSpacing(0)
@@ -3069,8 +4118,9 @@ class NotebookSection(QFrame):
         self.key = key
         self.on_change = on_change
         self.setObjectName("notebookSection")
+        self.setMinimumWidth(0)
         # 折叠区只按内容高度占位；滚动页剩余高度交给末尾弹簧，不能把空栏目拉厚。
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Maximum)
         title, hint = SECTION_META[key]
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 11, 14, 13)
@@ -3093,6 +4143,8 @@ class NotebookSection(QFrame):
         heading.addWidget(self.add)
         layout.addLayout(heading)
         self.body = QWidget()
+        self.body.setMinimumWidth(0)
+        self.body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         body_layout = QVBoxLayout(self.body)
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(8)
@@ -3170,7 +4222,8 @@ class FixedTextSection(QFrame):
     def __init__(self, title: str, placeholder: str, on_change, parent=None):
         super().__init__(parent)
         self.setObjectName("notebookSection")
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Maximum)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 11, 14, 13)
         layout.setSpacing(8)
@@ -3201,6 +4254,8 @@ class LessonNotebook(QWidget):
     def __init__(self, on_change):
         super().__init__()
         self.on_change = on_change
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.scroll_area: QScrollArea | None = None
         self.sections = {
             "knowledge": NotebookSection("knowledge", CompactKnowledgeCard, on_change),
@@ -3325,6 +4380,8 @@ class ChapterNotebook(QWidget):
     def __init__(self, on_change):
         super().__init__()
         self.on_change = on_change
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 18)
         layout.setSpacing(12)
@@ -3510,8 +4567,14 @@ class MainWindow(QMainWindow):
         self.sync_reload_timer.timeout.connect(self.reload_from_sync)
         self.sync_watcher.fileChanged.connect(self.on_sync_path_changed)
         self.sync_watcher.directoryChanged.connect(self.on_sync_path_changed)
+        self.pending_sync_payload: dict | None = None
+        self.sync_write_timer = QTimer(self)
+        self.sync_write_timer.setSingleShot(True)
+        self.sync_write_timer.setInterval(15000)
+        self.sync_write_timer.timeout.connect(self.flush_pending_sync)
         self.lock_timer = QTimer(self)
-        self.lock_timer.setInterval(45000)
+        # 锁仅用于防止另一台电脑改同一节，不应像笔记保存一样频繁触发云盘更新。
+        self.lock_timer.setInterval(5 * 60 * 1000)
         self.lock_timer.timeout.connect(self.refresh_current_lock)
         self.source_root = find_source_root()
         self.pdf_index = PdfReferenceIndex()
@@ -3530,6 +4593,12 @@ class MainWindow(QMainWindow):
         # 目录切换非常频繁。只有编辑区实际发生了变化才落盘，避免每次点目录都
         # 同步写完整 JSON 并阻塞界面。
         self.current_editor_fingerprint = ""
+        # 编辑内容的持久化也合并到一次停顿后：输入时不反复序列化整本笔记、
+        # 刷新完成进度或触发文件监控；切换小节、导出和退出仍立即强制保存。
+        self.editor_save_timer = QTimer(self)
+        self.editor_save_timer.setSingleShot(True)
+        self.editor_save_timer.setInterval(320)
+        self.editor_save_timer.timeout.connect(self.save_current)
         self.pending_screenshot_field: FormulaTextEdit | None = None
         self.pending_screenshot_context: dict | None = None
         self.active_reference_target: dict | None = None
@@ -3553,6 +4622,9 @@ class MainWindow(QMainWindow):
         self.populate_tree()
         self.update_progress()
         self.update_sync_indicator()
+        if self.pending_sync_payload:
+            # 恢复上次意外退出前的本机草稿后，给界面完成启动的时间，再批量同步一次。
+            QTimer.singleShot(15000, self.flush_pending_sync)
 
     def load_catalog(self) -> list[dict]:
         lessons = []
@@ -3615,6 +4687,13 @@ class MainWindow(QMainWindow):
             return {}
         try:
             payload = json.loads(source.read_text(encoding="utf-8"))
+            # 同步模式下，本机草稿的修订号更高表示上一次编辑尚未批量推送到云端。
+            # 优先恢复它，但仍保留云端指纹用于后续冲突判断。
+            if self.storage.enabled:
+                draft = self.storage.read_json(LOCAL_DRAFT_PATH)
+                if int(draft.get("revision", 0) or 0) > int(payload.get("revision", 0) or 0):
+                    payload = draft
+                    self.pending_sync_payload = draft
             raw = payload.get("notes", {})
             self.notes_revision = int(payload.get("revision", 0) or 0)
             self.chapter_notes = payload.get("chapter_notes", {}) if isinstance(payload.get("chapter_notes", {}), dict) else {}
@@ -3691,6 +4770,8 @@ class MainWindow(QMainWindow):
             text = "本机保存"
         elif self.external_change_pending:
             text = "同步冲突待处理"
+        elif self.pending_sync_payload:
+            text = "本机已保存 · 待同步"
         elif self.held_lock_id:
             text = "正在编辑 · 已锁定"
         else:
@@ -3737,7 +4818,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(holder)
         layout.setContentsMargins(18, 14, 18, 16)
         layout.setSpacing(10)
-        self.editor = LessonNotebook(self.save_current)
+        self.editor = LessonNotebook(self.schedule_save_current)
         self.editor.open_pdf_requested.connect(self.open_current_in_reader)
         self.editor.shared_reference_requested.connect(self.confirm_shared_reference)
         self.context_bar = QFrame()
@@ -3766,15 +4847,21 @@ class MainWindow(QMainWindow):
         context.addWidget(self.reader_toggle_button)
         layout.addWidget(self.context_bar)
 
-        self.chapter_editor = ChapterNotebook(self.save_current)
+        self.chapter_editor = ChapterNotebook(self.schedule_save_current)
         self.chapter_editor.intro_page_correction_requested.connect(self.correct_chapter_intro_page)
         self.editor_stack = QStackedWidget()
         self.editor_stack.setObjectName("editorStack")
+        self.editor_stack.setMinimumWidth(0)
+        self.editor_stack.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.editor_stack.addWidget(self.editor)
         self.editor_stack.addWidget(self.chapter_editor)
         self.editor_scroll = QScrollArea()
         self.editor_scroll.setObjectName("editorScroll")
+        self.editor_scroll.setMinimumWidth(0)
         self.editor_scroll.setWidgetResizable(True)
+        # 中间编辑器的唯一滚动方向是纵向。所有正文由流式卡片和公式网页按
+        # 当前列宽换行；横向滚动条只会掩盖“某个子控件仍在撑宽”的问题。
+        self.editor_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.editor_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.editor_scroll.setWidget(self.editor_stack)
         self.editor.attach_scroll_area(self.editor_scroll)
@@ -4106,6 +5193,7 @@ class MainWindow(QMainWindow):
 
     def configure_sync(self) -> None:
         self.save_current()
+        self.flush_pending_sync()
         folder = QFileDialog.getExistingDirectory(self, "选择坚果云中的同步文件夹", str(self.storage.sync_parent or Path.home()))
         if not folder:
             return
@@ -4227,7 +5315,6 @@ class MainWindow(QMainWindow):
             return False
         self.held_lock_id = lock_id
         self.external_change_pending = False
-        self.lock_timer.start()
         self.status_label.setText("正在编辑本节（已同步锁定）")
         self.update_sync_indicator()
         return True
@@ -4504,7 +5591,14 @@ class MainWindow(QMainWindow):
             }
         return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
+    def schedule_save_current(self, *_args) -> None:
+        """输入停顿后再持久化；编辑中的布局不因每个字符被磁盘工作打断。"""
+        if not self.loading and self.current_id:
+            self.editor_save_timer.start()
+
     def save_current(self) -> None:
+        if self.editor_save_timer.isActive():
+            self.editor_save_timer.stop()
         if self.loading or not self.current_id:
             return
         editor_fingerprint = self.editor_state_fingerprint()
@@ -4540,15 +5634,11 @@ class MainWindow(QMainWindow):
         self.write_notes()
         self.update_progress()
 
-    def write_notes(self) -> None:
+    def make_notes_payload(self) -> dict:
         path = data_path()
-        disk_fingerprint = self.storage.fingerprint(path)
-        if self.storage.enabled and self.notes_fingerprint and disk_fingerprint and disk_fingerprint != self.notes_fingerprint:
-            if not self.resolve_write_conflict():
-                return
         disk_payload = self.storage.read_json(path)
         disk_revision = int(disk_payload.get("revision", 0) or 0)
-        payload = {
+        return {
             "version": 6,
             "revision": max(self.notes_revision, disk_revision) + 1,
             "updated_at": now(),
@@ -4560,14 +5650,55 @@ class MainWindow(QMainWindow):
             "reference_mappings": self.reference_mappings,
             "shared_reference_groups": self.shared_reference_groups,
         }
+
+    def write_notes(self, immediate: bool = False) -> None:
+        """本机每次变更立即落草稿；坚果云只在停顿后批量接收一次完整 JSON。"""
+        payload = self.make_notes_payload()
+        if self.storage.enabled and not immediate:
+            try:
+                NotebookStorage.atomic_write(LOCAL_DRAFT_PATH, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+            except OSError as error:
+                QMessageBox.warning(self, "本机草稿保存失败", str(error))
+                return
+            self.pending_sync_payload = payload
+            self.sync_write_timer.start()
+            self.status_label.setText("已保存到本机；停止输入后将同步")
+            self.update_sync_indicator()
+            return
+        self.write_payload_to_disk(payload)
+
+    def flush_pending_sync(self) -> None:
+        if not self.pending_sync_payload:
+            return
+        payload = self.pending_sync_payload
+        self.pending_sync_payload = None
+        if self.write_payload_to_disk(payload) and self.held_lock_id:
+            # 锁只随一次真实的批量同步续期；静止阅读不会再让坚果云持续出现更新。
+            self.storage.refresh_lock(self.held_lock_id)
+
+    def write_payload_to_disk(self, payload: dict) -> bool:
+        path = data_path()
+        disk_fingerprint = self.storage.fingerprint(path)
+        if self.storage.enabled and self.notes_fingerprint and disk_fingerprint and disk_fingerprint != self.notes_fingerprint:
+            if not self.resolve_write_conflict():
+                # 保留本机草稿，等待用户下次保存时再处理。
+                self.pending_sync_payload = payload
+                return False
         try:
             self.storage.write_json(path, payload)
         except OSError as error:
             QMessageBox.warning(self, "保存失败", str(error))
-            return
+            return False
         self.notes_revision = payload["revision"]
         self.notes_fingerprint = self.storage.fingerprint(path)
+        if self.storage.enabled:
+            try:
+                LOCAL_DRAFT_PATH.unlink(missing_ok=True)
+            except OSError:
+                pass
         self.configure_sync_watcher()
+        self.update_sync_indicator()
+        return True
 
     def ensure_local_pdf_root(self) -> bool:
         """同步只带笔记和截图；找不到 PDF 时在本机单独选择一次教材目录。"""
@@ -4857,10 +5988,11 @@ class MainWindow(QMainWindow):
             parts.extend(["## 基本例习题类型", ""])
             for entry in note["patterns"]:
                 parts.extend([f"### {entry.get('title') or '未命名题型'}", ""])
-                if entry.get("example"):
-                    parts.extend(["**示例**", "", entry["example"], ""])
-                if entry.get("note"):
-                    parts.extend(["**备注**", "", entry["note"], ""])
+                content = entry.get("content") or "\n".join(
+                    str(part) for part in (entry.get("example", ""), entry.get("note", "")) if str(part).strip()
+                )
+                if content:
+                    parts.extend([content, ""])
         if note["examples"]:
             parts.extend(["## 有价值的例习题", ""])
             for entry in note["examples"]:
@@ -4982,6 +6114,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.save_current()
+        self.flush_pending_sync()
         self.release_current_lock()
         super().closeEvent(event)
 
@@ -4994,7 +6127,7 @@ def main() -> None:
     if APP_ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     app.setStyleSheet("""
-        QMainWindow { background: #18232e; color: #dce7ee; }
+        QMainWindow, QDialog { background: #18232e; color: #dce7ee; }
         #sidebar { background: #1b2732; border-right: 1px solid #324452; }
         #sidebarHolder { background: #1b2732; }
         #workspace { background: #18232e; }
@@ -5025,8 +6158,10 @@ def main() -> None:
         #dragGrip { color: #728a98; font-size: 18px; padding-right: 2px; }
         #intro { background: #1d3449; border: 1px solid #345c7c; border-left: 4px solid #3f98f5; border-radius: 7px; padding: 7px; color: #d5e7fb; }
         #sourceImage { background: transparent; border: 0; border-radius: 5px; padding: 0; color: #718096; }
-        #noteItem, #questionItem { background: #273743; border: 1px solid #3b5260; border-radius: 6px; }
-        #followupItem { background: #1f2c36; border: 1px solid #334b5b; border-radius: 5px; }
+        #noteItem, #questionItem { background: #263945; border: 1px solid #3b5869; border-radius: 7px; }
+        #noteItem:hover, #questionItem:hover { border-color: #4b7187; }
+        #followupItem { background: #21333f; border: 1px solid #385466; border-radius: 6px; }
+        #dropIndicator { background: #62b7ff; border: 0; border-radius: 1px; }
         #followupTag { color: #a8c8dd; font-size: 12px; font-weight: 650; }
         #textbookAttachment { background: #1f2c36; border: 1px solid #3b5260; border-radius: 7px; }
         #attachmentSource { background: transparent; color: #78baff; border: 0; padding: 3px 4px; font-size: 12px; font-weight: 600; }
@@ -5034,7 +6169,7 @@ def main() -> None:
         #missingAttachment { color: #ff9a9f; padding: 5px 7px; }
         #cardList, #followupList { background: transparent; border: 0; outline: 0; }
         QListWidget::item { border: 0; } QListWidget::item:selected { background: transparent; }
-        QListWidget::item:drop { border: 2px solid #3f98f5; }
+        QListWidget::item:drop { border: 0; background: transparent; }
         QTextEdit, QLineEdit, QComboBox, QSpinBox { background: #1d2a34; border: 1px solid #3b5260; color: #e5eef3; border-radius: 6px; padding: 7px; selection-background-color: #246eae; }
         QTextEdit:focus, QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border: 2px solid #4b9fff; }
         QPushButton { background: #236eaf; color: white; border: 0; border-radius: 6px; padding: 7px 11px; font-weight: 600; }
@@ -5054,6 +6189,15 @@ def main() -> None:
         #bookmarkBox { padding: 5px 7px; }
         #captureBar { background: #1e3c59; border: 1px solid #3b719e; border-radius: 7px; color: #d8eaff; }
         #pdfScroll { background: #141e27; border: 1px solid #354a59; border-radius: 7px; }
+        QPdfView, QPdfView::viewport { background: #141e27; }
+        /* Qt 的 PDF 视图和滚动区会各自创建内部滚动条；统一覆盖其轨道、空白区和滑块，避免出现系统默认的白色槽。 */
+        QScrollBar:vertical { background: #141e27; width: 12px; margin: 2px 1px; border: 0; }
+        QScrollBar:horizontal { background: #141e27; height: 12px; margin: 1px 2px; border: 0; }
+        QScrollBar::handle:vertical { background: #59707f; min-height: 32px; border-radius: 5px; margin: 1px 2px; }
+        QScrollBar::handle:horizontal { background: #59707f; min-width: 32px; border-radius: 5px; margin: 2px 1px; }
+        QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover { background: #7c9aac; }
+        QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; background: transparent; border: 0; }
+        QScrollBar::add-page, QScrollBar::sub-page { background: #141e27; }
         #pdfEmpty { color: #9eb3c0; }
         #comparisonWindow { background: #18232e; color: #dce7ee; }
         #comparisonWindowTitle { color: #e8f2f8; font-size: 18px; font-weight: 700; padding: 2px 1px; }
